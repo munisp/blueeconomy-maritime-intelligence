@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -15,6 +16,8 @@ func New(store *incident.Store, authMode string) http.Handler {
 	server := &Server{store: store}
 	api := http.NewServeMux()
 	api.HandleFunc("POST /v1/incidents", server.create)
+	api.HandleFunc("POST /v1/feed-sources", server.registerFeedSource)
+	api.HandleFunc("POST /v1/feed-events/admit", server.admitFeedEvent)
 	api.HandleFunc("GET /v1/incidents/", server.get)
 	api.HandleFunc("POST /v1/incidents/{incidentID}/correlations", server.correlate)
 	api.HandleFunc("POST /v1/incidents/{incidentID}/assignment", server.assign)
@@ -27,6 +30,63 @@ func New(store *incident.Store, authMode string) http.Handler {
 
 func (server *Server) health(response http.ResponseWriter, _ *http.Request) {
 	writeJSON(response, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (server *Server) registerFeedSource(response http.ResponseWriter, request *http.Request) {
+	var input struct {
+		SourceID        string `json:"source_id"`
+		SourceKind      string `json:"source_kind"`
+		Authority       string `json:"authority"`
+		PublicKeyBase64 string `json:"public_key_base64"`
+		Active          bool   `json:"active"`
+	}
+	decoder := json.NewDecoder(request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&input); err != nil {
+		writeError(response, http.StatusBadRequest, "invalid feed source JSON")
+		return
+	}
+	key, err := base64.RawStdEncoding.DecodeString(input.PublicKeyBase64)
+	if err != nil {
+		writeError(response, http.StatusBadRequest, "public_key_base64 is invalid")
+		return
+	}
+	if err := server.store.RegisterFeedSource(request.Context(), incident.FeedSourceRegistration{SourceID: input.SourceID, SourceKind: input.SourceKind, Authority: input.Authority, PublicKey: key, Active: input.Active}); err != nil {
+		writeIncidentError(response, err)
+		return
+	}
+	writeJSON(response, http.StatusCreated, map[string]string{"source_id": input.SourceID, "status": "registered"})
+}
+
+func (server *Server) admitFeedEvent(response http.ResponseWriter, request *http.Request) {
+	var input struct {
+		SourceID        string `json:"source_id"`
+		SourceEventID   string `json:"source_event_id"`
+		PayloadBase64   string `json:"payload_base64"`
+		SignatureBase64 string `json:"signature_base64"`
+	}
+	decoder := json.NewDecoder(request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&input); err != nil {
+		writeError(response, http.StatusBadRequest, "invalid feed event JSON")
+		return
+	}
+	payload, err := base64.StdEncoding.DecodeString(input.PayloadBase64)
+	if err != nil {
+		writeError(response, http.StatusBadRequest, "payload_base64 is invalid")
+		return
+	}
+	signature, err := incident.DecodeFeedSignature(input.SignatureBase64)
+	if err != nil {
+		writeError(response, http.StatusBadRequest, "signature_base64 is invalid")
+		return
+	}
+	admission, err := server.store.AdmitFeedEvent(request.Context(), incident.FeedAdmissionRequest{SourceID: input.SourceID, SourceEventID: input.SourceEventID, Payload: payload, Signature: signature})
+	if err != nil {
+		writeIncidentError(response, err)
+		return
+	}
+	writeJSON(response, http.StatusCreated, admission)
 }
 
 func (server *Server) create(response http.ResponseWriter, request *http.Request) {
