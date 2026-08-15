@@ -16,6 +16,8 @@ func New(store *incident.Store, authMode string) http.Handler {
 	api := http.NewServeMux()
 	api.HandleFunc("POST /v1/incidents", server.create)
 	api.HandleFunc("GET /v1/incidents/", server.get)
+	api.HandleFunc("POST /v1/incidents/{incidentID}/correlations", server.correlate)
+	api.HandleFunc("POST /v1/incidents/{incidentID}/assignment", server.assign)
 	api.HandleFunc("POST /v1/incidents/", server.transition)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", server.health)
@@ -61,6 +63,38 @@ type transitionRequest struct {
 	ExpectedVersion int64 `json:"expected_version"`
 }
 
+func (server *Server) correlate(response http.ResponseWriter, request *http.Request) {
+	var input incident.CorrelationRequest
+	decoder := json.NewDecoder(request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&input); err != nil {
+		writeError(response, http.StatusBadRequest, "invalid spatial correlation JSON request")
+		return
+	}
+	correlation, err := server.store.Correlate(request.Context(), request.PathValue("incidentID"), input)
+	if err != nil {
+		writeIncidentError(response, err)
+		return
+	}
+	writeJSON(response, http.StatusCreated, correlation)
+}
+
+func (server *Server) assign(response http.ResponseWriter, request *http.Request) {
+	var input incident.AssignmentRequest
+	decoder := json.NewDecoder(request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&input); err != nil {
+		writeError(response, http.StatusBadRequest, "invalid analyst assignment JSON request")
+		return
+	}
+	assignment, err := server.store.Assign(request.Context(), request.PathValue("incidentID"), input)
+	if err != nil {
+		writeIncidentError(response, err)
+		return
+	}
+	writeJSON(response, http.StatusOK, assignment)
+}
+
 func (server *Server) transition(response http.ResponseWriter, request *http.Request) {
 	parts := strings.Split(strings.TrimPrefix(request.URL.Path, "/v1/incidents/"), "/")
 	if len(parts) != 2 || parts[0] == "" {
@@ -97,7 +131,7 @@ func writeIncidentError(response http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, incident.ErrNotFound):
 		writeError(response, http.StatusNotFound, err.Error())
-	case errors.Is(err, incident.ErrIdempotencyConflict), errors.Is(err, incident.ErrOptimisticConflict), errors.Is(err, incident.ErrInvalidTransition):
+	case errors.Is(err, incident.ErrIdempotencyConflict), errors.Is(err, incident.ErrCorrelationConflict), errors.Is(err, incident.ErrOptimisticConflict), errors.Is(err, incident.ErrInvalidTransition):
 		writeError(response, http.StatusConflict, err.Error())
 	default:
 		writeError(response, http.StatusInternalServerError, "internal maritime incident failure")

@@ -54,3 +54,41 @@ func TestValidIncidentLifecycle(t *testing.T) {
 		t.Fatal("invalid lifecycle transition accepted")
 	}
 }
+
+func TestCorrelationRequestValidation(t *testing.T) {
+	valid := CorrelationRequest{
+		GeofenceID: "port-a", Relation: "INSIDE", Latitude: 6.45, Longitude: 3.39,
+		EvidenceSHA256: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		CorrelatedBy:   "spatial-engine",
+	}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("valid correlation rejected: %v", err)
+	}
+	invalid := valid
+	invalid.Latitude = 91
+	if err := invalid.Validate(); err == nil {
+		t.Fatal("out-of-range latitude accepted")
+	}
+	invalid = valid
+	invalid.EvidenceSHA256 = "sha256:ABC"
+	if err := invalid.Validate(); err == nil {
+		t.Fatal("invalid evidence hash accepted")
+	}
+	invalid = valid
+	invalid.Relation = "UNKNOWN"
+	if err := invalid.Validate(); err == nil {
+		t.Fatal("invalid spatial relation accepted")
+	}
+}
+
+func TestAssignmentRequestRequiresMakerCheckerSeparation(t *testing.T) {
+	valid := AssignmentRequest{ExpectedVersion: 1, AnalystID: "analyst-001", AssignedBy: "supervisor-001"}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("valid assignment rejected: %v", err)
+	}
+	invalid := valid
+	invalid.AnalystID = invalid.AssignedBy
+	if err := invalid.Validate(); err == nil {
+		t.Fatal("self-assignment accepted")
+	}
+}

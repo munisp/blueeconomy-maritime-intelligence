@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -25,15 +26,27 @@ func main() {
 
 func run() error {
 	databaseURL := requiredEnv("DATABASE_URL")
-	migrationPath := requiredEnv("MIGRATION_PATH")
+	migrationPaths := requiredEnv("MIGRATION_PATH")
 	port := requiredEnv("PORT")
 	authMode := requiredEnv("AUTH_MODE")
 	if authMode != server.AuthModeLoopbackTrustedProxy {
 		return fmt.Errorf("AUTH_MODE must be %q until a verified Ministry edge is configured", server.AuthModeLoopbackTrustedProxy)
 	}
-	migration, err := os.ReadFile(filepath.Clean(migrationPath))
-	if err != nil {
-		return fmt.Errorf("read migration: %w", err)
+	migrationPathsList := strings.Split(migrationPaths, ",")
+	if len(migrationPathsList) == 0 {
+		return errors.New("MIGRATION_PATH must contain at least one path")
+	}
+	migrations := make([][]byte, 0, len(migrationPathsList))
+	for _, migrationPath := range migrationPathsList {
+		migrationPath = strings.TrimSpace(migrationPath)
+		if migrationPath == "" {
+			return errors.New("MIGRATION_PATH contains an empty path")
+		}
+		migration, err := os.ReadFile(filepath.Clean(migrationPath))
+		if err != nil {
+			return fmt.Errorf("read migration %q: %w", migrationPath, err)
+		}
+		migrations = append(migrations, migration)
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -42,8 +55,10 @@ func run() error {
 		return err
 	}
 	defer store.Close()
-	if err := store.Exec(ctx, string(migration)); err != nil {
-		return fmt.Errorf("apply migration: %w", err)
+	for index, migration := range migrations {
+		if err := store.Exec(ctx, string(migration)); err != nil {
+			return fmt.Errorf("apply migration %d: %w", index+1, err)
+		}
 	}
 	httpServer := &http.Server{
 		Addr: ":" + port, Handler: server.New(store, authMode), ReadHeaderTimeout: 5 * time.Second,

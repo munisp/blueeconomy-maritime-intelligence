@@ -165,3 +165,134 @@ func (store *Store) Transition(ctx context.Context, incidentID string, expectedV
 	}
 	return updated, nil
 }
+
+func (store *Store) Correlate(ctx context.Context, incidentID string, request CorrelationRequest) (SpatialCorrelation, error) {
+	if !incidentIDPattern.MatchString(incidentID) {
+		return SpatialCorrelation{}, ErrNotFound
+	}
+	if err := request.Validate(); err != nil {
+		return SpatialCorrelation{}, err
+	}
+	tx, err := store.pool.Begin(ctx)
+	if err != nil {
+		return SpatialCorrelation{}, fmt.Errorf("begin correlation: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	createdAt := time.Now().UTC()
+	correlationID := uuid.New()
+	var retained SpatialCorrelation
+	err = tx.QueryRow(ctx, `
+		INSERT INTO maritime_incident_spatial_correlations (
+			correlation_id, incident_id, geofence_id, relation, latitude, longitude,
+			evidence_sha256, correlated_by, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		ON CONFLICT (incident_id, geofence_id) DO NOTHING
+		RETURNING correlation_id, incident_id, geofence_id, relation, latitude, longitude,
+			evidence_sha256, correlated_by, created_at`,
+		correlationID, incidentID, request.GeofenceID, request.Relation, request.Latitude,
+		request.Longitude, request.EvidenceSHA256, request.CorrelatedBy, createdAt,
+	).Scan(&retained.CorrelationID, &retained.IncidentID, &retained.GeofenceID, &retained.Relation,
+		&retained.Latitude, &retained.Longitude, &retained.EvidenceSHA256, &retained.CorrelatedBy,
+		&retained.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		err = tx.QueryRow(ctx, `
+			SELECT correlation_id, incident_id, geofence_id, relation, latitude, longitude,
+				evidence_sha256, correlated_by, created_at
+			FROM maritime_incident_spatial_correlations
+			WHERE incident_id = $1 AND geofence_id = $2 FOR UPDATE`, incidentID, request.GeofenceID).
+			Scan(&retained.CorrelationID, &retained.IncidentID, &retained.GeofenceID, &retained.Relation,
+				&retained.Latitude, &retained.Longitude, &retained.EvidenceSHA256, &retained.CorrelatedBy,
+				&retained.CreatedAt)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return SpatialCorrelation{}, ErrNotFound
+		}
+		if err != nil {
+			return SpatialCorrelation{}, fmt.Errorf("lookup correlation: %w", err)
+		}
+		if retained.Relation != request.Relation || retained.Latitude != request.Latitude ||
+			retained.Longitude != request.Longitude || retained.EvidenceSHA256 != request.EvidenceSHA256 ||
+			retained.CorrelatedBy != request.CorrelatedBy {
+			return SpatialCorrelation{}, ErrCorrelationConflict
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return SpatialCorrelation{}, fmt.Errorf("commit correlation replay: %w", err)
+		}
+		return retained, nil
+	}
+	if err != nil {
+		return SpatialCorrelation{}, fmt.Errorf("insert correlation: %w", err)
+	}
+	payload, err := json.Marshal(retained)
+	if err != nil {
+		return SpatialCorrelation{}, fmt.Errorf("encode correlation event: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO maritime_incident_outbox (event_id, incident_id, event_type, payload, created_at)
+		VALUES ($1, $2, 'incident.spatial_correlated', $3, $4)`, uuid.New(), incidentID, payload, createdAt); err != nil {
+		return SpatialCorrelation{}, fmt.Errorf("write correlation event: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return SpatialCorrelation{}, fmt.Errorf("commit correlation: %w", err)
+	}
+	return retained, nil
+}
+
+func (store *Store) Assign(ctx context.Context, incidentID string, request AssignmentRequest) (AnalystAssignment, error) {
+	if !incidentIDPattern.MatchString(incidentID) {
+		return AnalystAssignment{}, ErrNotFound
+	}
+	if err := request.Validate(); err != nil {
+		return AnalystAssignment{}, err
+	}
+	tx, err := store.pool.Begin(ctx)
+	if err != nil {
+		return AnalystAssignment{}, fmt.Errorf("begin assignment: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	assignedAt := time.Now().UTC()
+	var assignment AnalystAssignment
+	err = tx.QueryRow(ctx, `
+		UPDATE maritime_incidents
+		SET updated_at = $1, version = version + 1
+		WHERE incident_id = $2 AND version = $3 AND status <> 'CLOSED'
+		RETURNING version`, assignedAt, incidentID, request.ExpectedVersion).Scan(&assignment.IncidentVersion)
+	if errors.Is(err, pgx.ErrNoRows) {
+		current, getErr := store.Get(ctx, incidentID)
+		if errors.Is(getErr, ErrNotFound) {
+			return AnalystAssignment{}, ErrNotFound
+		}
+		if getErr != nil || current.Version != request.ExpectedVersion {
+			return AnalystAssignment{}, ErrOptimisticConflict
+		}
+		return AnalystAssignment{}, ErrInvalidTransition
+	}
+	if err != nil {
+		return AnalystAssignment{}, fmt.Errorf("update assignment version: %w", err)
+	}
+	assignment.IncidentID = incidentID
+	assignment.AnalystID = request.AnalystID
+	assignment.AssignedBy = request.AssignedBy
+	assignment.AssignedAt = assignedAt
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO maritime_incident_assignments (incident_id, analyst_id, assigned_by, assigned_at, incident_version)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (incident_id) DO UPDATE SET analyst_id = EXCLUDED.analyst_id,
+			assigned_by = EXCLUDED.assigned_by, assigned_at = EXCLUDED.assigned_at,
+			incident_version = EXCLUDED.incident_version`, incidentID, request.AnalystID, request.AssignedBy,
+		assignedAt, assignment.IncidentVersion); err != nil {
+		return AnalystAssignment{}, fmt.Errorf("persist assignment: %w", err)
+	}
+	payload, err := json.Marshal(assignment)
+	if err != nil {
+		return AnalystAssignment{}, fmt.Errorf("encode assignment event: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO maritime_incident_outbox (event_id, incident_id, event_type, payload, created_at)
+		VALUES ($1, $2, 'incident.assigned', $3, $4)`, uuid.New(), incidentID, payload, assignedAt); err != nil {
+		return AnalystAssignment{}, fmt.Errorf("write assignment event: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return AnalystAssignment{}, fmt.Errorf("commit assignment: %w", err)
+	}
+	return assignment, nil
+}
