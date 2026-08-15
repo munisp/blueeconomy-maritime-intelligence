@@ -19,7 +19,7 @@ trap cleanup EXIT
 server_binary=$(mktemp)
 GOFLAGS='' go build -o "$server_binary" ./cmd/maritime-intelligence
 DATABASE_URL='postgres://blueeconomy:local-only-integration-password@127.0.0.1:55434/blueeconomy_intelligence?sslmode=disable' \
-MIGRATION_PATH="$repo_root/db/migrations/0001_incidents.sql,$repo_root/db/migrations/0002_casework.sql" PORT=18081 AUTH_MODE=loopback_trusted_proxy \
+MIGRATION_PATH="$repo_root/db/migrations/0001_incidents.sql,$repo_root/db/migrations/0002_casework.sql,$repo_root/db/migrations/0003_outbox_delivery.sql" PORT=18081 AUTH_MODE=loopback_trusted_proxy \
 "$server_binary" >"$repo_root/.integration-server.log" 2>&1 &
 server_pid=$!
 for _ in $(seq 1 30); do if curl --fail --silent http://127.0.0.1:18081/healthz >/dev/null; then break; fi; sleep 1; done
