@@ -16,15 +16,14 @@ import (
 )
 
 type config struct {
-	databaseURL   string
-	brokers       []string
-	topic         string
-	workerID      string
-	lease         time.Duration
-	pollInterval  time.Duration
-	maxBackoff    time.Duration
-	migrationPath string
-	transport     string
+	databaseURL  string
+	brokers      []string
+	topic        string
+	workerID     string
+	lease        time.Duration
+	pollInterval time.Duration
+	maxBackoff   time.Duration
+	transport    string
 }
 
 func main() {
@@ -46,15 +45,6 @@ func run() error {
 		return err
 	}
 	defer store.Close()
-	for _, path := range strings.Split(cfg.migrationPath, ",") {
-		migration, readErr := os.ReadFile(path)
-		if readErr != nil {
-			return fmt.Errorf("read migration %q: %w", path, readErr)
-		}
-		if execErr := store.Exec(ctx, string(migration)); execErr != nil {
-			return fmt.Errorf("apply migration %q: %w", path, execErr)
-		}
-	}
 	writer := &kafka.Writer{
 		Addr:         kafka.TCP(cfg.brokers...),
 		Topic:        cfg.topic,
@@ -168,12 +158,8 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
-	migrationPath := os.Getenv("MIGRATION_PATH")
-	if migrationPath == "" {
-		return config{}, errors.New("MIGRATION_PATH must be set")
-	}
 	return config{databaseURL: databaseURL, brokers: brokers, topic: topic, workerID: workerID,
-		lease: lease, pollInterval: poll, maxBackoff: maxBackoff, migrationPath: migrationPath, transport: transport}, nil
+		lease: lease, pollInterval: poll, maxBackoff: maxBackoff, transport: transport}, nil
 }
 
 func durationEnv(name string, fallback time.Duration) (time.Duration, error) {
