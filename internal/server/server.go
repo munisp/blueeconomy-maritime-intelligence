@@ -18,6 +18,7 @@ func New(store *incident.Store, authMode string) http.Handler {
 	api.HandleFunc("POST /v1/incidents", server.create)
 	api.HandleFunc("POST /v1/feed-sources", server.registerFeedSource)
 	api.HandleFunc("POST /v1/feed-events/admit", server.admitFeedEvent)
+	api.HandleFunc("POST /v1/feed-events/admit-incident", server.admitFeedIncident)
 	api.HandleFunc("GET /v1/incidents/", server.get)
 	api.HandleFunc("POST /v1/incidents/{incidentID}/correlations", server.correlate)
 	api.HandleFunc("POST /v1/incidents/{incidentID}/assignment", server.assign)
@@ -87,6 +88,37 @@ func (server *Server) admitFeedEvent(response http.ResponseWriter, request *http
 		return
 	}
 	writeJSON(response, http.StatusCreated, admission)
+}
+
+func (server *Server) admitFeedIncident(response http.ResponseWriter, request *http.Request) {
+	var input struct {
+		SourceID        string `json:"source_id"`
+		SourceEventID   string `json:"source_event_id"`
+		PayloadBase64   string `json:"payload_base64"`
+		SignatureBase64 string `json:"signature_base64"`
+	}
+	decoder := json.NewDecoder(request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&input); err != nil {
+		writeError(response, http.StatusBadRequest, "invalid feed incident JSON")
+		return
+	}
+	payload, err := base64.StdEncoding.DecodeString(input.PayloadBase64)
+	if err != nil {
+		writeError(response, http.StatusBadRequest, "payload_base64 is invalid")
+		return
+	}
+	signature, err := incident.DecodeFeedSignature(input.SignatureBase64)
+	if err != nil {
+		writeError(response, http.StatusBadRequest, "signature_base64 is invalid")
+		return
+	}
+	result, err := server.store.AdmitFeedIncident(request.Context(), incident.SignedFeedIncidentRequest{FeedAdmissionRequest: incident.FeedAdmissionRequest{SourceID: input.SourceID, SourceEventID: input.SourceEventID, Payload: payload, Signature: signature}})
+	if err != nil {
+		writeIncidentError(response, err)
+		return
+	}
+	writeJSON(response, http.StatusCreated, result)
 }
 
 func (server *Server) create(response http.ResponseWriter, request *http.Request) {

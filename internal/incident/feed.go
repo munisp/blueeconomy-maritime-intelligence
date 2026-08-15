@@ -7,8 +7,10 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -130,3 +132,94 @@ func DecodeFeedSignature(value string) ([]byte, error) {
 func SameFeedPayload(a, b []byte) bool { return bytes.Equal(a, b) }
 
 func FeedEventID() string { return uuid.NewString() }
+
+type SignedFeedIncidentRequest struct {
+	FeedAdmissionRequest
+}
+
+type SignedFeedIncidentResult struct {
+	Admission FeedAdmission `json:"admission"`
+	Incident  Incident      `json:"incident"`
+}
+
+func (store *Store) AdmitFeedIncident(ctx context.Context, request SignedFeedIncidentRequest) (SignedFeedIncidentResult, error) {
+	if err := request.FeedAdmissionRequest.Validate(); err != nil {
+		return SignedFeedIncidentResult{}, err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(request.Payload))
+	decoder.DisallowUnknownFields()
+	var incidentRequest CreateRequest
+	if err := decoder.Decode(&incidentRequest); err != nil {
+		return SignedFeedIncidentResult{}, errors.New("signed feed payload must be one incident creation object")
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF {
+		return SignedFeedIncidentResult{}, errors.New("signed feed payload must contain one incident creation object")
+	}
+	if incidentRequest.SourceEventID != request.SourceID+":"+request.SourceEventID {
+		return SignedFeedIncidentResult{}, errors.New("signed incident source_event_id must bind source_id and source_event_id")
+	}
+	if incidentRequest.CreatedBy != "feed:"+request.SourceID {
+		return SignedFeedIncidentResult{}, errors.New("signed incident created_by must bind source_id")
+	}
+	if err := incidentRequest.Validate(); err != nil {
+		return SignedFeedIncidentResult{}, err
+	}
+
+	tx, err := store.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		return SignedFeedIncidentResult{}, fmt.Errorf("begin feed incident transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	admission, err := admitFeedEventInTransaction(ctx, tx, request.FeedAdmissionRequest)
+	if err != nil {
+		return SignedFeedIncidentResult{}, err
+	}
+	created, err := createIncidentInTransaction(ctx, tx, incidentRequest)
+	if err != nil {
+		return SignedFeedIncidentResult{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return SignedFeedIncidentResult{}, fmt.Errorf("commit feed incident transaction: %w", err)
+	}
+	return SignedFeedIncidentResult{Admission: admission, Incident: created}, nil
+}
+
+func admitFeedEventInTransaction(ctx context.Context, tx pgx.Tx, request FeedAdmissionRequest) (FeedAdmission, error) {
+	var publicKey []byte
+	var fingerprint string
+	var active bool
+	if err := tx.QueryRow(ctx, `SELECT public_key, key_fingerprint, active FROM maritime_feed_sources WHERE source_id=$1 FOR SHARE`, request.SourceID).Scan(&publicKey, &fingerprint, &active); errors.Is(err, pgx.ErrNoRows) {
+		return FeedAdmission{}, ErrNotFound
+	} else if err != nil {
+		return FeedAdmission{}, fmt.Errorf("load feed source: %w", err)
+	}
+	if !active {
+		return FeedAdmission{}, errors.New("feed source is inactive")
+	}
+	if !ed25519.Verify(ed25519.PublicKey(publicKey), feedSigningBytes(request.SourceID, request.SourceEventID, request.Payload), request.Signature) {
+		return FeedAdmission{}, errors.New("feed event signature verification failed")
+	}
+	digest := sha256.Sum256(request.Payload)
+	payloadSHA256 := "sha256:" + hex.EncodeToString(digest[:])
+	receivedAt := time.Now().UTC()
+	var retainedReceivedAt time.Time
+	err := tx.QueryRow(ctx, `
+		INSERT INTO maritime_feed_events (source_id, source_event_id, payload_sha256, signature, received_at)
+		VALUES ($1,$2,$3,$4,$5)
+		ON CONFLICT (source_id, source_event_id) DO NOTHING
+		RETURNING received_at`, request.SourceID, request.SourceEventID, payloadSHA256, request.Signature, receivedAt).Scan(&retainedReceivedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		var retainedDigest string
+		var retainedSignature []byte
+		err = tx.QueryRow(ctx, `SELECT payload_sha256, signature, received_at FROM maritime_feed_events WHERE source_id=$1 AND source_event_id=$2 FOR UPDATE`, request.SourceID, request.SourceEventID).Scan(&retainedDigest, &retainedSignature, &retainedReceivedAt)
+		if err != nil {
+			return FeedAdmission{}, fmt.Errorf("load retained feed event: %w", err)
+		}
+		if retainedDigest != payloadSHA256 || !bytes.Equal(retainedSignature, request.Signature) {
+			return FeedAdmission{}, ErrIdempotencyConflict
+		}
+	} else if err != nil {
+		return FeedAdmission{}, fmt.Errorf("record feed event: %w", err)
+	}
+	return FeedAdmission{SourceID: request.SourceID, SourceEventID: request.SourceEventID, PayloadSHA256: payloadSHA256, KeyFingerprint: fingerprint, ReceivedAt: retainedReceivedAt}, nil
+}

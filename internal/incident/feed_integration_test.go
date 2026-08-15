@@ -6,12 +6,74 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestSignedFeedIncidentIsAtomicAgainstPostgreSQL(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	store, err := Open(ctx, os.Getenv("DATABASE_URL"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceID := "radar-feed-incident"
+	if err := store.RegisterFeedSource(ctx, FeedSourceRegistration{SourceID: sourceID, SourceKind: "RADAR", Authority: "local-authority", PublicKey: publicKey, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	eventID := "radar-event-incident-001"
+	create := CreateRequest{IncidentID: "incident-radar-feed-001", SourceEventID: sourceID + ":" + eventID, Category: "NAVIGATION", Severity: SeverityHigh, Title: "Signed radar exception", Description: "Authorized feed created incident", OccurredAt: time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC), CreatedBy: "feed:" + sourceID}
+	payload, err := json.Marshal(create)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signature := ed25519.Sign(privateKey, feedSigningBytes(sourceID, eventID, payload))
+	result, err := store.AdmitFeedIncident(ctx, SignedFeedIncidentRequest{FeedAdmissionRequest: FeedAdmissionRequest{SourceID: sourceID, SourceEventID: eventID, Payload: payload, Signature: signature}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Incident.IncidentID != create.IncidentID || result.Admission.SourceEventID != eventID {
+		t.Fatalf("unexpected feed incident result: %+v", result)
+	}
+	if _, err := store.AdmitFeedIncident(ctx, SignedFeedIncidentRequest{FeedAdmissionRequest: FeedAdmissionRequest{SourceID: sourceID, SourceEventID: eventID, Payload: payload, Signature: signature}}); err != nil {
+		t.Fatalf("exact replay failed: %v", err)
+	}
+	var outboxCount int
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM maritime_incident_outbox WHERE incident_id=$1`, create.IncidentID).Scan(&outboxCount); err != nil {
+		t.Fatal(err)
+	}
+	if outboxCount != 1 {
+		t.Fatalf("expected one incident outbox event after exact replay, got %d", outboxCount)
+	}
+	invalidEventID := "radar-event-incident-rollback"
+	invalidCreate := create
+	invalidCreate.IncidentID = "incident-radar-feed-rollback"
+	invalidCreate.SourceEventID = "unbound-source-event"
+	invalidPayload, err := json.Marshal(invalidCreate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalidSignature := ed25519.Sign(privateKey, feedSigningBytes(sourceID, invalidEventID, invalidPayload))
+	if _, err := store.AdmitFeedIncident(ctx, SignedFeedIncidentRequest{FeedAdmissionRequest: FeedAdmissionRequest{SourceID: sourceID, SourceEventID: invalidEventID, Payload: invalidPayload, Signature: invalidSignature}}); err == nil {
+		t.Fatal("unbound signed incident payload was accepted")
+	}
+	var retainedFeedCount int
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM maritime_feed_events WHERE source_id=$1 AND source_event_id=$2`, sourceID, invalidEventID).Scan(&retainedFeedCount); err != nil {
+		t.Fatal(err)
+	}
+	if retainedFeedCount != 0 {
+		t.Fatal("invalid signed incident payload left durable feed evidence")
+	}
+}
 
 func TestAuthorizedFeedAdmissionAgainstPostgreSQL(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -24,8 +86,12 @@ func TestAuthorizedFeedAdmissionAgainstPostgreSQL(t *testing.T) {
 	if os.Getenv("SKIP_MIGRATION") != "true" {
 		for _, migrationPath := range strings.Split(os.Getenv("MIGRATION_PATH"), ",") {
 			migration, readErr := os.ReadFile(filepath.Clean(strings.TrimSpace(migrationPath)))
-			if readErr != nil { t.Fatal(readErr) }
-			if execErr := store.Exec(ctx, string(migration)); execErr != nil { t.Fatal(execErr) }
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if execErr := store.Exec(ctx, string(migration)); execErr != nil {
+				t.Fatal(execErr)
+			}
 		}
 	}
 	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)

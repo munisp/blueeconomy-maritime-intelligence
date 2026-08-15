@@ -44,9 +44,20 @@ func (store *Store) Create(ctx context.Context, request CreateRequest) (Incident
 		return Incident{}, fmt.Errorf("begin create: %w", err)
 	}
 	defer tx.Rollback(ctx)
+	retained, err := createIncidentInTransaction(ctx, tx, request)
+	if err != nil {
+		return Incident{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Incident{}, fmt.Errorf("commit incident: %w", err)
+	}
+	return retained, nil
+}
+
+func createIncidentInTransaction(ctx context.Context, tx pgx.Tx, request CreateRequest) (Incident, error) {
 	createdAt := time.Now().UTC()
 	var retained Incident
-	err = tx.QueryRow(ctx, `
+	err := tx.QueryRow(ctx, `
 		INSERT INTO maritime_incidents (
 			incident_id, source_event_id, category, severity, title, description,
 			occurred_at, created_by, status, created_at, updated_at, version
@@ -77,9 +88,6 @@ func (store *Store) Create(ctx context.Context, request CreateRequest) (Incident
 		if !retained.Matches(request) {
 			return Incident{}, ErrIdempotencyConflict
 		}
-		if err := tx.Commit(ctx); err != nil {
-			return Incident{}, fmt.Errorf("commit replay: %w", err)
-		}
 		return retained, nil
 	}
 	if err != nil {
@@ -93,9 +101,6 @@ func (store *Store) Create(ctx context.Context, request CreateRequest) (Incident
 		INSERT INTO maritime_incident_outbox (event_id, incident_id, event_type, payload, created_at)
 		VALUES ($1, $2, 'incident.created', $3, $4)`, uuid.New(), retained.IncidentID, payload, createdAt); err != nil {
 		return Incident{}, fmt.Errorf("write incident event: %w", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return Incident{}, fmt.Errorf("commit incident: %w", err)
 	}
 	return retained, nil
 }
