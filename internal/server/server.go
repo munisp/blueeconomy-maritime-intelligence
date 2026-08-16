@@ -17,6 +17,7 @@ func New(store *incident.Store, authMode string) http.Handler {
 	api := http.NewServeMux()
 	api.HandleFunc("POST /v1/incidents", server.create)
 	api.HandleFunc("POST /v1/feed-sources", server.registerFeedSource)
+	api.HandleFunc("POST /v1/feed-sources/{sourceID}/revoke", server.revokeFeedSource)
 	api.HandleFunc("POST /v1/feed-events/admit", server.admitFeedEvent)
 	api.HandleFunc("POST /v1/feed-events/admit-incident", server.admitFeedIncident)
 	api.HandleFunc("GET /v1/incidents/", server.get)
@@ -57,6 +58,24 @@ func (server *Server) registerFeedSource(response http.ResponseWriter, request *
 		return
 	}
 	writeJSON(response, http.StatusCreated, map[string]string{"source_id": input.SourceID, "status": "registered"})
+}
+
+func (server *Server) revokeFeedSource(response http.ResponseWriter, request *http.Request) {
+	var input struct {
+		Reason    string `json:"reason"`
+		RevokedBy string `json:"revoked_by"`
+	}
+	decoder := json.NewDecoder(request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&input); err != nil {
+		writeError(response, http.StatusBadRequest, "invalid feed source revocation JSON")
+		return
+	}
+	if err := server.store.RevokeFeedSource(request.Context(), incident.FeedSourceRevocation{SourceID: request.PathValue("sourceID"), Reason: input.Reason, RevokedBy: input.RevokedBy}); err != nil {
+		writeIncidentError(response, err)
+		return
+	}
+	writeJSON(response, http.StatusOK, map[string]string{"source_id": request.PathValue("sourceID"), "status": "revoked"})
 }
 
 func (server *Server) admitFeedEvent(response http.ResponseWriter, request *http.Request) {

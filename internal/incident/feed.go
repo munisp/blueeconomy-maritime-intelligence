@@ -223,3 +223,61 @@ func admitFeedEventInTransaction(ctx context.Context, tx pgx.Tx, request FeedAdm
 	}
 	return FeedAdmission{SourceID: request.SourceID, SourceEventID: request.SourceEventID, PayloadSHA256: payloadSHA256, KeyFingerprint: fingerprint, ReceivedAt: retainedReceivedAt}, nil
 }
+
+// FeedSourceRevocation records an irreversible local source-retirement decision.
+type FeedSourceRevocation struct {
+	SourceID  string `json:"source_id"`
+	Reason    string `json:"reason"`
+	RevokedBy string `json:"revoked_by"`
+}
+
+func (request FeedSourceRevocation) Validate() error {
+	if !incidentIDPattern.MatchString(request.SourceID) || !incidentIDPattern.MatchString(request.RevokedBy) {
+		return errors.New("source_id and revoked_by must be canonical identifiers")
+	}
+	if strings.TrimSpace(request.Reason) == "" || len(request.Reason) > 512 {
+		return errors.New("reason must be between 1 and 512 characters")
+	}
+	return nil
+}
+
+// RevokeFeedSource deactivates an admitted source and preserves who and why.
+// Repeating exactly the same revocation is idempotent; conflicting evidence fails.
+func (store *Store) RevokeFeedSource(ctx context.Context, request FeedSourceRevocation) error {
+	if err := request.Validate(); err != nil {
+		return err
+	}
+	tx, err := store.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		return fmt.Errorf("begin feed source revocation: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var active bool
+	if err := tx.QueryRow(ctx, `SELECT active FROM maritime_feed_sources WHERE source_id=$1 FOR UPDATE`, request.SourceID).Scan(&active); errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	} else if err != nil {
+		return fmt.Errorf("load feed source: %w", err)
+	}
+	var retainedReason, retainedBy string
+	err = tx.QueryRow(ctx, `SELECT reason, revoked_by FROM maritime_feed_source_revocations WHERE source_id=$1 FOR UPDATE`, request.SourceID).Scan(&retainedReason, &retainedBy)
+	if err == nil {
+		if retainedReason != request.Reason || retainedBy != request.RevokedBy {
+			return ErrIdempotencyConflict
+		}
+		return tx.Commit(ctx)
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("load feed source revocation: %w", err)
+	}
+	if !active {
+		return errors.New("inactive feed source has no retained revocation evidence")
+	}
+	now := time.Now().UTC()
+	if _, err := tx.Exec(ctx, `UPDATE maritime_feed_sources SET active=false, updated_at=$2 WHERE source_id=$1`, request.SourceID, now); err != nil {
+		return fmt.Errorf("deactivate feed source: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO maritime_feed_source_revocations (source_id, reason, revoked_by, revoked_at) VALUES ($1,$2,$3,$4)`, request.SourceID, request.Reason, request.RevokedBy, now); err != nil {
+		return fmt.Errorf("record feed source revocation: %w", err)
+	}
+	return tx.Commit(ctx)
+}
