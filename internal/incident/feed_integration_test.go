@@ -7,6 +7,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -119,5 +120,45 @@ func TestAuthorizedFeedAdmissionAgainstPostgreSQL(t *testing.T) {
 	bad[0] ^= 0xff
 	if _, err := store.AdmitFeedEvent(ctx, FeedAdmissionRequest{SourceID: sourceID, SourceEventID: "ais-event-integration-002", Payload: payload, Signature: bad}); err == nil {
 		t.Fatal("invalid signature was accepted")
+	}
+}
+
+func TestFeedSourceRevocationAgainstPostgreSQL(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	store, err := Open(ctx, os.Getenv("DATABASE_URL"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceID := "revocable-feed-integration"
+	if err := store.RegisterFeedSource(ctx, FeedSourceRegistration{SourceID: sourceID, SourceKind: "AIS", Authority: "local-authority", PublicKey: publicKey, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	revocation := FeedSourceRevocation{SourceID: sourceID, Reason: "key-compromise", RevokedBy: "security-operator"}
+	if err := store.RevokeFeedSource(ctx, revocation); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RevokeFeedSource(ctx, revocation); err != nil {
+		t.Fatalf("exact revocation replay failed: %v", err)
+	}
+	if err := store.RevokeFeedSource(ctx, FeedSourceRevocation{SourceID: sourceID, Reason: "different-reason", RevokedBy: "security-operator"}); !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("conflicting revocation error = %v", err)
+	}
+	payload := []byte(`{"mmsi":"636019999"}`)
+	signature := ed25519.Sign(privateKey, feedSigningBytes(sourceID, "post-revocation-event", payload))
+	if _, err := store.AdmitFeedEvent(ctx, FeedAdmissionRequest{SourceID: sourceID, SourceEventID: "post-revocation-event", Payload: payload, Signature: signature}); err == nil {
+		t.Fatal("revoked source admitted signed event")
+	}
+	var active bool
+	if err := store.pool.QueryRow(ctx, `SELECT active FROM maritime_feed_sources WHERE source_id=$1`, sourceID).Scan(&active); err != nil {
+		t.Fatal(err)
+	}
+	if active {
+		t.Fatal("revoked source remains active")
 	}
 }
