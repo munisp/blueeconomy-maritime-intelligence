@@ -162,3 +162,27 @@ func TestFeedSourceRevocationAgainstPostgreSQL(t *testing.T) {
 		t.Fatal("revoked source remains active")
 	}
 }
+
+
+func TestFeedSourceKeyRotationAgainstPostgreSQL(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	store, err := Open(ctx, os.Getenv("DATABASE_URL"))
+	if err != nil { t.Fatal(err) }
+	defer store.Close()
+	oldPublic, oldPrivate, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil { t.Fatal(err) }
+	newPublic, newPrivate, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil { t.Fatal(err) }
+	sourceID := "rotating-feed-integration"
+	if err := store.RegisterFeedSource(ctx, FeedSourceRegistration{SourceID: sourceID, SourceKind: "VTS", Authority: "local-authority", PublicKey: oldPublic, Active: true}); err != nil { t.Fatal(err) }
+	if err := store.RotateFeedSourceKey(ctx, FeedSourceKeyRotation{SourceID: sourceID, NewPublicKey: newPublic, GraceUntil: time.Now().UTC().Add(time.Hour), RotatedBy: "key-operator"}); err != nil { t.Fatal(err) }
+	payload := []byte(`{"vessel":"test"}`)
+	oldSignature := ed25519.Sign(oldPrivate, feedSigningBytes(sourceID, "rotation-grace-event", payload))
+	if _, err := store.AdmitFeedEvent(ctx, FeedAdmissionRequest{SourceID: sourceID, SourceEventID: "rotation-grace-event", Payload: payload, Signature: oldSignature}); err != nil { t.Fatalf("prior key rejected within grace window: %v", err) }
+	newSignature := ed25519.Sign(newPrivate, feedSigningBytes(sourceID, "rotation-new-key-event", payload))
+	if _, err := store.AdmitFeedEvent(ctx, FeedAdmissionRequest{SourceID: sourceID, SourceEventID: "rotation-new-key-event", Payload: payload, Signature: newSignature}); err != nil { t.Fatalf("replacement key rejected: %v", err) }
+	if _, err := store.pool.Exec(ctx, `UPDATE maritime_feed_source_key_rotations SET grace_until=$2 WHERE source_id=$1`, sourceID, time.Now().UTC().Add(-time.Second)); err != nil { t.Fatal(err) }
+	expiredSignature := ed25519.Sign(oldPrivate, feedSigningBytes(sourceID, "rotation-expired-event", payload))
+	if _, err := store.AdmitFeedEvent(ctx, FeedAdmissionRequest{SourceID: sourceID, SourceEventID: "rotation-expired-event", Payload: payload, Signature: expiredSignature}); err == nil { t.Fatal("expired prior key was accepted") }
+}
