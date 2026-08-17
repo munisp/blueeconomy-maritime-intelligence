@@ -27,6 +27,14 @@ curl --fail --silent http://127.0.0.1:18081/healthz >/dev/null
 DATABASE_URL='postgres://blueeconomy:local-only-integration-password@127.0.0.1:55434/blueeconomy_intelligence?sslmode=disable' SKIP_MIGRATION=true go test -tags feedintegration -race ./internal/incident -run 'Test(AuthorizedFeedAdmission|SignedFeedIncidentIsAtomic|FeedSourceRevocation|FeedSourceKeyRotation)AgainstPostgreSQL' -count=1
 if curl --silent --show-error -o /tmp/incident-unauthenticated.json -w '%{http_code}' -X GET http://127.0.0.1:18081/v1/incidents/incident-001 | grep -q '^401$'; then :; else echo 'unauthenticated incident request was not rejected' >&2; exit 1; fi
 headers=(-H 'Content-Type: application/json' -H 'X-Trusted-Proxy: loopback' -H 'X-Authenticated-Principal: integration-operator')
+old_key=$(head -c 32 /dev/zero | base64 -w0 | tr -d '=')
+new_key=$(head -c 32 /dev/zero | tr '\000' '\001' | base64 -w0 | tr -d '=')
+grace_until=$(date -u -d '+1 day' '+%Y-%m-%dT%H:%M:%SZ')
+feed_source=$(curl --fail --silent -X POST http://127.0.0.1:18081/v1/feed-sources "${headers[@]}" --data "{\"source_id\":\"feed-http-001\",\"source_kind\":\"VTS\",\"authority\":\"local-authority\",\"public_key_base64\":\"$old_key\",\"active\":true}")
+printf '%s' "$feed_source" | grep -q '"status":"registered"'
+rotation=$(curl --fail --silent -X POST http://127.0.0.1:18081/v1/feed-sources/feed-http-001/rotate-key "${headers[@]}" --data "{\"public_key_base64\":\"$new_key\",\"grace_until\":\"$grace_until\",\"rotated_by\":\"key-operator\"}")
+printf '%s' "$rotation" | grep -q '"status":"key_rotated"'
+if curl --silent --show-error -o /tmp/feed-rotation-invalid.json -w '%{http_code}' -X POST http://127.0.0.1:18081/v1/feed-sources/feed-http-001/rotate-key "${headers[@]}" --data '{"public_key_base64":"not-base64","grace_until":"$grace_until","rotated_by":"key-operator"}' | grep -q '^400$'; then :; else echo 'malformed rotation key was not rejected' >&2; exit 1; fi
 payload='{"incident_id":"incident-001","source_event_id":"event-001","category":"distress","severity":"HIGH","title":"Distress alert","description":"Verified distress alert from approved source","occurred_at":"2026-08-15T12:00:00Z","created_by":"operator-001"}'
 created=$(curl --fail --silent -X POST http://127.0.0.1:18081/v1/incidents "${headers[@]}" --data "$payload")
 printf '%s' "$created" | grep -q '"status":"OPEN"'
@@ -52,6 +60,8 @@ printf '%s' "$resolve" | grep -q '"status":"RESOLVED"'
 close=$(curl --fail --silent -X POST http://127.0.0.1:18081/v1/incidents/incident-001/close "${headers[@]}" --data '{"expected_version":5}')
 printf '%s' "$close" | grep -q '"status":"CLOSED"'
 container_id=$("${docker_prefix[@]}" ps --filter name=maritime-intelligence-postgres -q | head -n1)
+rotation_count=$("${docker_prefix[@]}" exec "$container_id" psql -p 55434 -U blueeconomy -d blueeconomy_intelligence -Atc "select count(*) from maritime_feed_source_key_rotations where source_id = 'feed-http-001';")
+test "$rotation_count" = 1
 outbox_count=$("${docker_prefix[@]}" exec "$container_id" psql -p 55434 -U blueeconomy -d blueeconomy_intelligence -Atc 'select count(*) from maritime_incident_outbox where incident_id = '\''incident-001'\'';')
 test "$outbox_count" = 7
 correlation_count=$(${docker_prefix[@]} exec "$container_id" psql -p 55434 -U blueeconomy -d blueeconomy_intelligence -Atc 'select count(*) from maritime_incident_spatial_correlations where incident_id = '\''incident-001'\'';')
