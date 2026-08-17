@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/munisp/blueeconomy-maritime-intelligence/internal/incident"
 )
@@ -18,6 +19,7 @@ func New(store *incident.Store, authMode string) http.Handler {
 	api.HandleFunc("POST /v1/incidents", server.create)
 	api.HandleFunc("POST /v1/feed-sources", server.registerFeedSource)
 	api.HandleFunc("POST /v1/feed-sources/{sourceID}/revoke", server.revokeFeedSource)
+	api.HandleFunc("POST /v1/feed-sources/{sourceID}/rotate-key", server.rotateFeedSourceKey)
 	api.HandleFunc("POST /v1/feed-events/admit", server.admitFeedEvent)
 	api.HandleFunc("POST /v1/feed-events/admit-incident", server.admitFeedIncident)
 	api.HandleFunc("GET /v1/incidents/", server.get)
@@ -76,6 +78,30 @@ func (server *Server) revokeFeedSource(response http.ResponseWriter, request *ht
 		return
 	}
 	writeJSON(response, http.StatusOK, map[string]string{"source_id": request.PathValue("sourceID"), "status": "revoked"})
+}
+
+func (server *Server) rotateFeedSourceKey(response http.ResponseWriter, request *http.Request) {
+	var input struct {
+		PublicKeyBase64 string    `json:"public_key_base64"`
+		GraceUntil      time.Time `json:"grace_until"`
+		RotatedBy       string    `json:"rotated_by"`
+	}
+	decoder := json.NewDecoder(request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&input); err != nil {
+		writeError(response, http.StatusBadRequest, "invalid feed key rotation JSON")
+		return
+	}
+	key, err := base64.RawStdEncoding.DecodeString(input.PublicKeyBase64)
+	if err != nil {
+		writeError(response, http.StatusBadRequest, "public_key_base64 is invalid")
+		return
+	}
+	if err := server.store.RotateFeedSourceKey(request.Context(), incident.FeedSourceKeyRotation{SourceID: request.PathValue("sourceID"), NewPublicKey: key, GraceUntil: input.GraceUntil, RotatedBy: input.RotatedBy}); err != nil {
+		writeIncidentError(response, err)
+		return
+	}
+	writeJSON(response, http.StatusOK, map[string]string{"source_id": request.PathValue("sourceID"), "status": "key_rotated"})
 }
 
 func (server *Server) admitFeedEvent(response http.ResponseWriter, request *http.Request) {
