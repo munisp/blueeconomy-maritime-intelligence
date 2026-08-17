@@ -98,8 +98,13 @@ func (store *Store) AdmitFeedEvent(ctx context.Context, request FeedAdmissionReq
 	if !active {
 		return FeedAdmission{}, errors.New("feed source is inactive")
 	}
-	if !ed25519.Verify(ed25519.PublicKey(publicKey), feedSigningBytes(request.SourceID, request.SourceEventID, request.Payload), request.Signature) {
-		return FeedAdmission{}, errors.New("feed event signature verification failed")
+	signingBytes := feedSigningBytes(request.SourceID, request.SourceEventID, request.Payload)
+	if !ed25519.Verify(ed25519.PublicKey(publicKey), signingBytes, request.Signature) {
+		var graceKey []byte
+		err = store.pool.QueryRow(ctx, `SELECT prior_public_key FROM maritime_feed_source_key_rotations WHERE source_id=$1 AND grace_until>$2 ORDER BY rotated_at DESC LIMIT 1`, request.SourceID, time.Now().UTC()).Scan(&graceKey)
+		if err != nil || !ed25519.Verify(ed25519.PublicKey(graceKey), signingBytes, request.Signature) {
+			return FeedAdmission{}, errors.New("feed event signature verification failed")
+		}
 	}
 	digest := sha256.Sum256(request.Payload)
 	receivedAt := time.Now().UTC()
@@ -196,8 +201,13 @@ func admitFeedEventInTransaction(ctx context.Context, tx pgx.Tx, request FeedAdm
 	if !active {
 		return FeedAdmission{}, errors.New("feed source is inactive")
 	}
-	if !ed25519.Verify(ed25519.PublicKey(publicKey), feedSigningBytes(request.SourceID, request.SourceEventID, request.Payload), request.Signature) {
-		return FeedAdmission{}, errors.New("feed event signature verification failed")
+	signingBytes := feedSigningBytes(request.SourceID, request.SourceEventID, request.Payload)
+	if !ed25519.Verify(ed25519.PublicKey(publicKey), signingBytes, request.Signature) {
+		var graceKey []byte
+		err := tx.QueryRow(ctx, `SELECT prior_public_key FROM maritime_feed_source_key_rotations WHERE source_id=$1 AND grace_until>$2 ORDER BY rotated_at DESC LIMIT 1`, request.SourceID, time.Now().UTC()).Scan(&graceKey)
+		if err != nil || !ed25519.Verify(ed25519.PublicKey(graceKey), signingBytes, request.Signature) {
+			return FeedAdmission{}, errors.New("feed event signature verification failed")
+		}
 	}
 	digest := sha256.Sum256(request.Payload)
 	payloadSHA256 := "sha256:" + hex.EncodeToString(digest[:])
@@ -280,4 +290,62 @@ func (store *Store) RevokeFeedSource(ctx context.Context, request FeedSourceRevo
 		return fmt.Errorf("record feed source revocation: %w", err)
 	}
 	return tx.Commit(ctx)
+}
+
+type FeedSourceKeyRotation struct {
+	SourceID     string            `json:"source_id"`
+	NewPublicKey ed25519.PublicKey `json:"new_public_key"`
+	GraceUntil   time.Time         `json:"grace_until"`
+	RotatedBy    string            `json:"rotated_by"`
+}
+
+func (request FeedSourceKeyRotation) Validate(now time.Time) error {
+	if !incidentIDPattern.MatchString(request.SourceID) || !incidentIDPattern.MatchString(request.RotatedBy) {
+		return errors.New("source_id and rotated_by must be canonical identifiers")
+	}
+	if len(request.NewPublicKey) != ed25519.PublicKeySize {
+		return errors.New("new ed25519 public key is required")
+	}
+	if !request.GraceUntil.After(now) || request.GraceUntil.After(now.Add(30*24*time.Hour)) {
+		return errors.New("grace_until must be after now and no more than 30 days ahead")
+	}
+	return nil
+}
+
+// RotateFeedSourceKey replaces the active verification key while retaining the prior key only until grace_until.
+func (store *Store) RotateFeedSourceKey(ctx context.Context, request FeedSourceKeyRotation) error {
+	now := time.Now().UTC()
+	if err := request.Validate(now); err != nil {
+		return err
+	}
+	tx, err := store.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		return fmt.Errorf("begin feed source key rotation: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var priorKey []byte
+	var priorFingerprint string
+	var active bool
+	if err := tx.QueryRow(ctx, `SELECT public_key, key_fingerprint, active FROM maritime_feed_sources WHERE source_id=$1 FOR UPDATE`, request.SourceID).Scan(&priorKey, &priorFingerprint, &active); errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	} else if err != nil {
+		return fmt.Errorf("load feed source: %w", err)
+	}
+	if !active {
+		return errors.New("feed source is inactive")
+	}
+	if bytes.Equal(priorKey, request.NewPublicKey) {
+		return errors.New("new key must differ from active key")
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO maritime_feed_source_key_rotations (source_id, prior_key_fingerprint, prior_public_key, grace_until, rotated_by, rotated_at) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (source_id, prior_key_fingerprint) DO UPDATE SET grace_until=EXCLUDED.grace_until, rotated_by=EXCLUDED.rotated_by, rotated_at=EXCLUDED.rotated_at`, request.SourceID, priorFingerprint, priorKey, request.GraceUntil, request.RotatedBy, now); err != nil {
+		return fmt.Errorf("record prior key: %w", err)
+	}
+	digest := sha256.Sum256(request.NewPublicKey)
+	if _, err := tx.Exec(ctx, `UPDATE maritime_feed_sources SET public_key=$2, key_fingerprint=$3, updated_at=$4 WHERE source_id=$1`, request.SourceID, []byte(request.NewPublicKey), "sha256:"+hex.EncodeToString(digest[:]), now); err != nil {
+		return fmt.Errorf("activate replacement key: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit feed source key rotation: %w", err)
+	}
+	return nil
 }
