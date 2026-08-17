@@ -1,0 +1,74 @@
+openapi: 3.1.0
+info:
+  title: Blue Economy S2 Maritime Intelligence API
+  version: 1.0.0
+  description: Local authenticated source lifecycle and incident ingestion contract. Provider endpoint, key and policy values are supplied by a signed G1 manifest.
+paths:
+  /healthz:
+    get:
+      responses: {'200': {description: Service health.}}
+  /v1/feed-sources:
+    post:
+      operationId: registerFeedSource
+      security: [{trustedProxy: []}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/FeedSourceRegistration'}}}}
+      responses: {'201': {description: Source registered.}, '409': {description: Existing source conflict.}, '422': {description: Invalid source identity/key.}}
+  /v1/feed-sources/{source_id}/revoke:
+    post:
+      operationId: revokeFeedSource
+      security: [{trustedProxy: []}]
+      parameters: [{$ref: '#/components/parameters/SourceID'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/FeedSourceRevocation'}}}}
+      responses: {'200': {description: Source revoked or exact replay.}, '409': {description: Conflicting revocation evidence.}}
+  /v1/feed-sources/{source_id}/events:
+    post:
+      operationId: admitSignedFeedEvent
+      security: [{trustedProxy: []}]
+      parameters: [{$ref: '#/components/parameters/SourceID'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/SignedFeedEvent'}}}}
+      responses: {'201': {description: Event provenance admitted.}, '409': {description: Duplicate/conflicting event.}, '422': {description: Invalid/inactive source or signature.}}
+  /v1/feed-sources/{source_id}/incidents:
+    post:
+      operationId: createIncidentFromSignedFeed
+      security: [{trustedProxy: []}]
+      parameters: [{$ref: '#/components/parameters/SourceID'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/SignedFeedIncident'}}}}
+      responses: {'201': {description: Provenance, incident and outbox event committed atomically.}, '409': {description: Replay/conflict.}, '422': {description: Signature or incident binding rejected.}}
+components:
+  securitySchemes:
+    trustedProxy: {type: apiKey, in: header, name: X-Authenticated-Principal}
+  parameters:
+    SourceID: {name: source_id, in: path, required: true, schema: {type: string, pattern: '^[A-Za-z0-9._:-]{1,128}$'}}
+  schemas:
+    FeedSourceRegistration:
+      type: object
+      additionalProperties: false
+      required: [source_id, source_kind, authority, public_key]
+      properties:
+        source_id: {type: string, pattern: '^[A-Za-z0-9._:-]{1,128}$'}
+        source_kind: {type: string, minLength: 1, maxLength: 64}
+        authority: {type: string, minLength: 1, maxLength: 256}
+        public_key: {type: string, description: Ed25519 public key in base64.}
+    FeedSourceRevocation:
+      type: object
+      additionalProperties: false
+      required: [reason, revoked_by]
+      properties:
+        reason: {type: string, minLength: 1, maxLength: 1024}
+        revoked_by: {type: string, minLength: 1, maxLength: 256}
+    SignedFeedEvent:
+      type: object
+      additionalProperties: false
+      required: [event_id, occurred_at, payload, signature]
+      properties:
+        event_id: {type: string, minLength: 1, maxLength: 256}
+        occurred_at: {type: string, format: date-time}
+        payload: {type: object}
+        signature: {type: string, description: Base64 Ed25519 signature over the canonical event payload.}
+    SignedFeedIncident:
+      allOf:
+        - $ref: '#/components/schemas/SignedFeedEvent'
+        - type: object
+          required: [incident]
+          properties:
+            incident: {type: object, description: Incident request bound to source event identity.}
