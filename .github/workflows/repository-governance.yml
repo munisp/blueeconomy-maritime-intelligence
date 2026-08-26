@@ -26,6 +26,13 @@ jobs:
           set -euo pipefail
           test -s .github/CODEOWNERS
           test -s .github/branch-protection.main.json
-          grep -Fq 'required_approving_review_count' .github/branch-protection.main.json
-          grep -Fq 'require_code_owner_reviews' .github/branch-protection.main.json
-          grep -Fq 'allow_force_pushes' .github/branch-protection.main.json
+          jq -e '
+            .required_pull_request_reviews.required_approving_review_count >= 2 and
+            .required_pull_request_reviews.require_code_owner_reviews == true and
+            .required_pull_request_reviews.require_last_push_approval == true and
+            .enforce_admins == true and
+            .required_linear_history == true and
+            .required_conversation_resolution == true and
+            .allow_force_pushes == false and
+            .allow_deletions == false
+          ' .github/branch-protection.main.json
