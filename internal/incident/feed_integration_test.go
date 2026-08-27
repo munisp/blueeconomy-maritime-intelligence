@@ -121,6 +121,14 @@ func TestAuthorizedFeedAdmissionAgainstPostgreSQL(t *testing.T) {
 	if _, err := store.AdmitFeedEvent(ctx, FeedAdmissionRequest{SourceID: sourceID, SourceEventID: "ais-event-integration-002", Payload: payload, Signature: bad}); err == nil {
 		t.Fatal("invalid signature was accepted")
 	}
+	// Conflicting replay: same source_event_id with a different, validly
+	// signed payload must fail closed with ErrIdempotencyConflict, not be
+	// silently absorbed.
+	conflictingPayload := []byte(`{"mmsi":"636019999","lat":7.45,"lon":4.39}`)
+	conflictingSignature := ed25519.Sign(privateKey, feedSigningBytes(sourceID, eventID, conflictingPayload))
+	if _, err := store.AdmitFeedEvent(ctx, FeedAdmissionRequest{SourceID: sourceID, SourceEventID: eventID, Payload: conflictingPayload, Signature: conflictingSignature}); !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("conflicting replay must fail with ErrIdempotencyConflict, got %v", err)
+	}
 }
 
 func TestFeedSourceRevocationAgainstPostgreSQL(t *testing.T) {

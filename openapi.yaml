@@ -1,74 +1,197 @@
 openapi: 3.1.0
 info:
-  title: Blue Economy S2 Maritime Intelligence API
-  version: 1.0.0
-  description: Local authenticated source lifecycle and incident ingestion contract. Provider endpoint, key and policy values are supplied by a signed G1 manifest.
+  title: Blue Economy Maritime Intelligence API (Deep Blue Project ISR Analytics)
+  version: 1.1.0
+  description: >
+    Signed feed admission, incident lifecycle and Workstream F ISR analytics:
+    multi-modal detection ingestion (AIS/SAR/RF/acoustic/optical) with
+    mandatory classification labelling, clearance-scoped track/anomaly reads,
+    dual-control outcome ledger and platform envelope v1.0 outbox topics
+    maritime.isr.v1 / maritime.behaviour.v1 / maritime.outcome.v1.
+    Authentication is loopback_trusted_proxy (local edge headers) or
+    keycloak_rs256 (Bearer RS256 JWT verified against the realm JWKS).
 paths:
   /healthz:
     get:
+      operationId: health
       responses: {'200': {description: Service health.}}
+  /readyz:
+    get:
+      operationId: readiness
+      responses: {'200': {description: Ready (database reachable).}, '503': {description: Not ready.}}
+  /metrics:
+    get:
+      operationId: metrics
+      responses: {'200': {description: Prometheus metrics, including isr.anomaly.detection.latency (p99 <= 5s KPI).}}
   /v1/feed-sources:
     post:
       operationId: registerFeedSource
-      security: [{trustedProxy: []}]
+      security: [{trustedProxy: []}, {bearerAuth: []}]
       requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/FeedSourceRegistration'}}}}
       responses: {'201': {description: Source registered.}, '409': {description: Existing source conflict.}, '422': {description: Invalid source identity/key.}}
   /v1/feed-sources/{source_id}/revoke:
     post:
       operationId: revokeFeedSource
-      security: [{trustedProxy: []}]
+      security: [{trustedProxy: []}, {bearerAuth: []}]
       parameters: [{$ref: '#/components/parameters/SourceID'}]
       requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/FeedSourceRevocation'}}}}
       responses: {'200': {description: Source revoked or exact replay.}, '409': {description: Conflicting revocation evidence.}}
-  /v1/feed-sources/{source_id}/events:
+  /v1/feed-sources/{source_id}/rotate-key:
+    post:
+      operationId: rotateFeedSourceKey
+      security: [{trustedProxy: []}, {bearerAuth: []}]
+      parameters: [{$ref: '#/components/parameters/SourceID'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/FeedSourceKeyRotation'}}}}
+      responses: {'200': {description: Key rotated with bounded grace.}, '404': {description: Unknown source.}, '422': {description: Invalid rotation request.}}
+  /v1/feed-events/admit:
     post:
       operationId: admitSignedFeedEvent
-      security: [{trustedProxy: []}]
-      parameters: [{$ref: '#/components/parameters/SourceID'}]
+      description: Admits one signed feed event transactionally; a replay with a conflicting payload or signature returns 409.
+      security: [{trustedProxy: []}, {bearerAuth: []}]
       requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/SignedFeedEvent'}}}}
-      responses: {'201': {description: Event provenance admitted.}, '409': {description: Duplicate/conflicting event.}, '422': {description: Invalid/inactive source or signature.}}
-  /v1/feed-sources/{source_id}/incidents:
+      responses: {'201': {description: Event provenance admitted (or exact replay).}, '409': {description: Conflicting replay evidence.}, '422': {description: Invalid/inactive source or signature.}}
+  /v1/feed-events/admit-incident:
     post:
       operationId: createIncidentFromSignedFeed
-      security: [{trustedProxy: []}]
-      parameters: [{$ref: '#/components/parameters/SourceID'}]
-      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/SignedFeedIncident'}}}}
+      description: Atomically admits the signed feed event and creates the bound incident with one outbox event.
+      security: [{trustedProxy: []}, {bearerAuth: []}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/SignedFeedEvent'}}}}
       responses: {'201': {description: Provenance, incident and outbox event committed atomically.}, '409': {description: Replay/conflict.}, '422': {description: Signature or incident binding rejected.}}
+  /v1/isr/detections:admit:
+    post:
+      operationId: admitISRDetection
+      description: >
+        Admits one signed multi-modal detection. The detection payload carries
+        a mandatory classification label (UNCLASSIFIED/RESTRICTED/
+        CONFIDENTIAL/SECRET); missing or invalid labels are rejected
+        fail-closed. Exactly one modality payload (ais/sar/rf/acoustic/
+        optical) must be present and pass per-modality validation.
+      security: [{trustedProxy: []}, {bearerAuth: []}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/SignedDetection'}}}}
+      responses:
+        '201': {description: Detection admitted, fused and emitted to maritime.isr.v1.}
+        '403': {description: Read-only principal.}
+        '409': {description: Conflicting replay evidence.}
+        '422': {description: Validation, classification or signature failure.}
+  /v1/isr/detections:
+    get:
+      operationId: listISRDetections
+      description: Clearance-scoped detection listing; only detections at or below the caller clearance are returned. Insurer-aggregator role is denied.
+      security: [{trustedProxy: []}, {bearerAuth: []}]
+      parameters:
+        - {name: modality, in: query, schema: {type: string, enum: [AIS, SAR, RF, ACOUSTIC, OPTICAL]}}
+        - {name: mmsi, in: query, schema: {type: string, pattern: '^[0-9]{9}$'}}
+        - {name: since, in: query, schema: {type: string, format: date-time}}
+        - {name: limit, in: query, schema: {type: integer, maximum: 500}}
+      responses: {'200': {description: Detections at or below caller clearance.}, '403': {description: Insufficient role or clearance.}}
+  /v1/isr/tracks:
+    get:
+      operationId: listVesselTracks
+      description: Fused multi-modal vessel tracks filtered by caller clearance. Insurer-aggregator role never receives tracks.
+      security: [{trustedProxy: []}, {bearerAuth: []}]
+      responses: {'200': {description: Clearance-filtered tracks.}, '403': {description: Insufficient role or clearance.}}
+  /v1/isr/anomalies:
+    get:
+      operationId: listBehaviourAnomalies
+      description: Behaviour anomalies (dark-vessel, speed-outlier, rendezvous, loitering) at or below caller clearance; each carries correlation_refs for cross-workstream correlation.
+      security: [{trustedProxy: []}, {bearerAuth: []}]
+      parameters:
+        - {name: kind, in: query, schema: {type: string, enum: [dark-vessel, speed-outlier, rendezvous, loitering]}}
+        - {name: since, in: query, schema: {type: string, format: date-time}}
+        - {name: limit, in: query, schema: {type: integer, maximum: 500}}
+      responses: {'200': {description: Clearance-filtered anomalies.}, '403': {description: Insufficient role or clearance.}}
+  /v1/outcomes:
+    post:
+      operationId: proposeOutcome
+      description: First control of the dual-control outcome ledger; proposed_by is bound to the authenticated subject.
+      security: [{trustedProxy: []}, {bearerAuth: []}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/OutcomeProposal'}}}}
+      responses: {'201': {description: Proposal recorded.}, '409': {description: Conflicting proposal evidence.}, '422': {description: Invalid proposal.}, '503': {description: Outcome ledger not configured.}}
+  /v1/outcomes/{entry_id}/confirm:
+    post:
+      operationId: confirmOutcome
+      description: Second control. The confirmer must differ from the proposer (DB-enforced); confirmation posts the TigerBeetle transfer, writes the immutable ledger entry and emits maritime.outcome.v1.
+      security: [{trustedProxy: []}, {bearerAuth: []}]
+      parameters: [{name: entry_id, in: path, required: true, schema: {type: string, pattern: '^[A-Za-z0-9._:-]{1,128}$'}}]
+      responses: {'200': {description: Confirmed immutable entry.}, '404': {description: Unknown proposal.}, '409': {description: Dual-control violation or already confirmed.}}
+  /v1/outcomes/aggregates:
+    get:
+      operationId: outcomeAggregates
+      description: Classification-free outcome aggregates (counts and totals only); the only ISR read path open to the insurer-aggregator role.
+      security: [{trustedProxy: []}, {bearerAuth: []}]
+      responses: {'200': {description: Outcome aggregates.}, '403': {description: Insufficient role.}}
 components:
   securitySchemes:
-    trustedProxy: {type: apiKey, in: header, name: X-Authenticated-Principal}
+    trustedProxy: {type: apiKey, in: header, name: X-Authenticated-Principal, description: Local edge mode; edge also asserts X-Trusted-Proxy, X-Authenticated-Roles and X-Authenticated-Clearance.}
+    bearerAuth: {type: http, scheme: bearer, bearerFormat: JWT, description: Keycloak RS256 token; roles from realm_access.roles, clearance from the clearance claim.}
   parameters:
     SourceID: {name: source_id, in: path, required: true, schema: {type: string, pattern: '^[A-Za-z0-9._:-]{1,128}$'}}
   schemas:
+    Classification:
+      type: string
+      enum: [UNCLASSIFIED, RESTRICTED, CONFIDENTIAL, SECRET]
     FeedSourceRegistration:
       type: object
       additionalProperties: false
-      required: [source_id, source_kind, authority, public_key]
+      required: [source_id, source_kind, authority, public_key_base64, active]
       properties:
         source_id: {type: string, pattern: '^[A-Za-z0-9._:-]{1,128}$'}
-        source_kind: {type: string, minLength: 1, maxLength: 64}
+        source_kind: {type: string, enum: [AIS, VTS, RADAR, PORT, AGENCY, SAR, RF, ACOUSTIC, OPTICAL]}
         authority: {type: string, minLength: 1, maxLength: 256}
-        public_key: {type: string, description: Ed25519 public key in base64.}
+        public_key_base64: {type: string, description: Ed25519 public key, base64 (raw, unpadded).}
+        active: {type: boolean}
     FeedSourceRevocation:
       type: object
       additionalProperties: false
       required: [reason, revoked_by]
       properties:
-        reason: {type: string, minLength: 1, maxLength: 1024}
+        reason: {type: string, minLength: 1, maxLength: 512}
         revoked_by: {type: string, minLength: 1, maxLength: 256}
+    FeedSourceKeyRotation:
+      type: object
+      additionalProperties: false
+      required: [public_key_base64, grace_until, rotated_by]
+      properties:
+        public_key_base64: {type: string, description: Replacement Ed25519 public key, base64 (raw, unpadded).}
+        grace_until: {type: string, format: date-time, description: Prior-key grace deadline (<= 30 days ahead).}
+        rotated_by: {type: string, minLength: 1, maxLength: 256}
     SignedFeedEvent:
       type: object
       additionalProperties: false
-      required: [event_id, occurred_at, payload, signature]
+      required: [source_id, source_event_id, payload_base64, signature_base64]
       properties:
-        event_id: {type: string, minLength: 1, maxLength: 256}
-        occurred_at: {type: string, format: date-time}
-        payload: {type: object}
-        signature: {type: string, description: Base64 Ed25519 signature over the canonical event payload.}
-    SignedFeedIncident:
-      allOf:
-        - $ref: '#/components/schemas/SignedFeedEvent'
-        - type: object
-          required: [incident]
-          properties:
-            incident: {type: object, description: Incident request bound to source event identity.}
+        source_id: {type: string, pattern: '^[A-Za-z0-9._:-]{1,128}$'}
+        source_event_id: {type: string, pattern: '^[A-Za-z0-9._:-]{1,128}$'}
+        payload_base64: {type: string, description: Base64 canonical payload (<= 8 MiB decoded).}
+        signature_base64: {type: string, description: Base64 Ed25519 signature over source_id, source_event_id and the payload sha256. The same source_event_id replayed with a different payload or signature returns 409.}
+    SignedDetection:
+      type: object
+      additionalProperties: false
+      required: [source_id, source_event_id, payload_base64, signature_base64]
+      properties:
+        source_id: {type: string, pattern: '^[A-Za-z0-9._:-]{1,128}$'}
+        source_event_id: {type: string, pattern: '^[A-Za-z0-9._:-]{1,128}$'}
+        payload_base64:
+          type: string
+          description: >
+            Base64 canonical JSON detection: {event_id, source_id,
+            source_event_id, modality, classification, observed_at,
+            has_position, latitude?, longitude?, mmsi?, correlation_refs?,
+            exactly one of ais/sar/rf/acoustic/optical}. Per-modality
+            requirements: ais={mmsi, speed_knots, heading_deg};
+            sar={scene_ref, confidence}; rf={frequency_band, bearing_deg};
+            acoustic={signature_ref, confidence};
+            optical={image_ref, detection_boxes[1..64]}.
+        signature_base64: {type: string, description: Base64 Ed25519 signature (same scheme as SignedFeedEvent).}
+    OutcomeProposal:
+      type: object
+      additionalProperties: false
+      required: [entry_id, entry_kind, incident_ref, classification, metric, quantity, unit]
+      properties:
+        entry_id: {type: string, pattern: '^[A-Za-z0-9._:-]{1,128}$'}
+        entry_kind: {type: string, enum: [incident-verified, premium-delta]}
+        incident_ref: {type: string, pattern: '^[A-Za-z0-9._:-]{1,128}$'}
+        classification: {$ref: '#/components/schemas/Classification'}
+        metric: {type: string, enum: [incident-reduction-count, premium-delta-basis-points]}
+        quantity: {type: integer, minimum: 1}
+        unit: {type: string, enum: [incidents, basis-points]}
