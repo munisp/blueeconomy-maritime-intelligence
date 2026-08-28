@@ -112,6 +112,7 @@ type Telemetry struct {
 	requests       metric.Int64Counter
 	duration       metric.Float64Histogram
 	fusionLatency  metric.Float64Histogram
+	fusionErrors   metric.Int64Counter
 }
 
 // Setup builds the meter and tracer pipelines. The Prometheus exporter is
@@ -139,6 +140,10 @@ func Setup(ctx context.Context, config Config) (*Telemetry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create anomaly latency histogram: %w", err)
 	}
+	fusionErrors, err := meter.Int64Counter("isr.fusion.ingest_errors", metric.WithDescription("Fusion ingest failures after durable detection admission"))
+	if err != nil {
+		return nil, fmt.Errorf("create fusion error counter: %w", err)
+	}
 	telemetry := &Telemetry{
 		config:         config,
 		meterProvider:  meterProvider,
@@ -146,6 +151,7 @@ func Setup(ctx context.Context, config Config) (*Telemetry, error) {
 		requests:       requests,
 		duration:       duration,
 		fusionLatency:  fusionLatency,
+		fusionErrors:   fusionErrors,
 	}
 	if !config.Enabled {
 		telemetry.tracer = noop.NewTracerProvider().Tracer(config.ServiceName)
@@ -261,6 +267,13 @@ func (telemetry *Telemetry) Middleware(next http.Handler) http.Handler {
 		telemetry.duration.Record(ctx, time.Since(started).Seconds(), metricAttributes)
 		span.End()
 	})
+}
+
+// RecordFusionIngestError counts one fusion ingest failure observed after a
+// durable detection admission. No labels: classified-data discipline keeps
+// track content and source identifiers out of metrics.
+func (telemetry *Telemetry) RecordFusionIngestError(ctx context.Context) {
+	telemetry.fusionErrors.Add(ctx, 1)
 }
 
 // RecordDetectionLatency records one anomaly-detection latency observation

@@ -86,6 +86,43 @@ func (store *Store) RecordAnomalies(ctx context.Context, anomalies []Anomaly) er
 	return tx.Commit(ctx)
 }
 
+// AssociationReplay is one persisted track association with its retained
+// signed detection payload, used to rebuild fusion engine state on startup.
+type AssociationReplay struct {
+	TrackID string
+	Payload []byte
+}
+
+// ListAssociationsForReplay returns every persisted track association joined
+// to its retained detection payload, ordered by observation time (ties broken
+// deterministically) so a startup replay rebuilds engine state in a stable
+// order. Fail-closed: a row whose detection payload was purged or is missing
+// is an error, never a silently skipped association.
+func (store *Store) ListAssociationsForReplay(ctx context.Context) ([]AssociationReplay, error) {
+	rows, err := store.pool.Query(ctx, `
+		SELECT a.track_id, e.payload
+		FROM maritime_track_associations a
+		JOIN maritime_isr_events e
+			ON e.source_id = a.source_id AND e.source_event_id = a.source_event_id
+		ORDER BY a.observed_at ASC, a.associated_at ASC, a.source_id ASC, a.source_event_id ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("query track associations for replay: %w", err)
+	}
+	defer rows.Close()
+	replays := make([]AssociationReplay, 0)
+	for rows.Next() {
+		var replay AssociationReplay
+		if err := rows.Scan(&replay.TrackID, &replay.Payload); err != nil {
+			return nil, fmt.Errorf("scan track association replay row: %w", err)
+		}
+		replays = append(replays, replay)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate track association replay: %w", err)
+	}
+	return replays, nil
+}
+
 type txExec = pgx.Tx
 
 func recordAnomalyInTransaction(ctx context.Context, tx txExec, anomaly Anomaly) error {
@@ -113,10 +150,12 @@ func recordAnomalyInTransaction(ctx context.Context, tx txExec, anomaly Anomaly)
 	if err != nil {
 		return err
 	}
+	// The outbox row keeps the record-level clearance label (DB CHECK); the
+	// payload column carries the canonical envelope document verbatim.
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO maritime_isr_outbox (event_id, topic, event_type, classification, aggregate_key, payload, created_at)
 		VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-		uuid.New(), envelope.Topic, envelope.EventType, string(envelope.Classification), envelope.AggregateKey, envelopeBytes, anomaly.DetectedAt); err != nil {
+		uuid.New(), envelope.Topic, envelope.EventType, string(envelope.Clearance), envelope.AggregateKey, envelopeBytes, anomaly.DetectedAt); err != nil {
 		return fmt.Errorf("write anomaly outbox event: %w", err)
 	}
 	return nil

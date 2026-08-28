@@ -16,6 +16,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/munisp/blueeconomy-maritime-intelligence/internal/geo"
 	"github.com/munisp/blueeconomy-maritime-intelligence/internal/isr"
 )
@@ -165,10 +167,9 @@ type Engine struct {
 	now      func() time.Time
 	newID    func() string
 
-	mu        sync.Mutex
-	tracks    map[string]*Track
-	byMMSI    map[string]string
-	nextTrack int
+	mu     sync.Mutex
+	tracks map[string]*Track
+	byMMSI map[string]string
 }
 
 // NewEngine validates the configuration fail-closed. nil recorder/clock/id
@@ -198,9 +199,12 @@ func NewEngine(config Config, zones []geo.Zone, recorder LatencyRecorder, now fu
 	return engine, nil
 }
 
+// defaultTrackID allocates a collision-free fused-track identity. Track IDs
+// are UUID-based (not a restartable sequence) so a post-restart engine can
+// never mint an ID already persisted in maritime_vessel_tracks; replayed
+// associations keep their original persisted identity via Replay.
 func (engine *Engine) defaultTrackID() string {
-	engine.nextTrack++
-	return fmt.Sprintf("fused-track-%06d", engine.nextTrack)
+	return "fused-track-" + uuid.NewString()
 }
 
 // Ingest associates one validated detection into a track, updates rule state
@@ -221,6 +225,50 @@ func (engine *Engine) Ingest(ctx context.Context, detection isr.Detection) (stri
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
 	track := engine.associate(detection, position)
+	point := engine.absorbPointLocked(track, detection, position)
+	anomalies := engine.evaluateLocked(ctx, track, point, detection)
+	return track.TrackID, anomalies, nil
+}
+
+// Replay reinstates one persisted track association
+// (maritime_track_associations joined to its retained detection payload)
+// into engine state after a restart. The persisted track identity is pinned:
+// replay never mints a new track ID, so maritime_vessel_tracks rows and the
+// in-memory view keep the same identity and GET /v1/isr/tracks serves the
+// pre-restart state immediately. Rule bookkeeping (zone entry, pair
+// proximity, last-AIS) is restored without re-emitting anomalies — the
+// detections were already alerted and persisted at ingest time. Alert flags
+// stay reset, so a still-active anomaly re-fires once after restart
+// (fail-safe) rather than being silently lost.
+func (engine *Engine) Replay(trackID string, detection isr.Detection) error {
+	if err := detection.Validate(); err != nil {
+		return err
+	}
+	if !detection.HasPosition {
+		return errors.New("replayed association has no position")
+	}
+	if strings.TrimSpace(trackID) == "" || len(trackID) > 128 {
+		return errors.New("replay requires the persisted track identity")
+	}
+	position, err := geo.NewPosition(detection.Latitude, detection.Longitude)
+	if err != nil {
+		return err
+	}
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	track, ok := engine.tracks[trackID]
+	if !ok {
+		track = newTrack(trackID, detection.Classification)
+		engine.tracks[trackID] = track
+	}
+	point := engine.absorbPointLocked(track, detection, position)
+	engine.restoreRuleStateLocked(track, point)
+	return nil
+}
+
+// absorbPointLocked appends the detection's point to the track and updates
+// the MMSI binding, classification maximum and last-AIS marker.
+func (engine *Engine) absorbPointLocked(track *Track, detection isr.Detection, position geo.Position) TrackPoint {
 	point := TrackPoint{
 		DetectionRef: detection.SourceID + ":" + detection.SourceEventID,
 		Modality:     detection.Modality,
@@ -245,8 +293,69 @@ func (engine *Engine) Ingest(ctx context.Context, detection isr.Detection) (stri
 	if len(track.Points) > 4096 {
 		track.Points = append([]TrackPoint(nil), track.Points[len(track.Points)-4096:]...)
 	}
-	anomalies := engine.evaluateLocked(ctx, track, point, detection)
-	return track.TrackID, anomalies, nil
+	return point
+}
+
+// restoreRuleStateLocked replays zone-entry and pair-proximity bookkeeping
+// for one historical point without emitting anomalies. It mirrors the state
+// transitions of evaluateLocked minus the alert emission.
+func (engine *Engine) restoreRuleStateLocked(track *Track, point TrackPoint) {
+	insideRestricted := make(map[string]bool)
+	for _, zone := range engine.zones {
+		if zone.ZoneKind == geo.ZoneKindRestricted && zone.Contains(point.Position) {
+			insideRestricted[zone.ZoneID] = true
+			if _, seen := track.zoneEnter[zone.ZoneID]; !seen {
+				track.zoneEnter[zone.ZoneID] = point.ObservedAt
+			}
+		}
+	}
+	for zoneID := range track.zoneEnter {
+		if !insideRestricted[zoneID] {
+			delete(track.zoneEnter, zoneID)
+		}
+	}
+	for _, other := range engine.tracks {
+		if other.TrackID == track.TrackID {
+			continue
+		}
+		last, ok := other.Last()
+		if !ok {
+			continue
+		}
+		separated := func() {
+			delete(track.nearSince, other.TrackID)
+			delete(other.nearSince, track.TrackID)
+		}
+		if point.ObservedAt.Sub(last.ObservedAt) > engine.config.RendezvousMinDuration || last.ObservedAt.Sub(point.ObservedAt) > engine.config.RendezvousMinDuration {
+			separated()
+			continue
+		}
+		if geo.DistanceMeters(last.Position, point.Position) > engine.config.RendezvousRadiusMeters {
+			separated()
+			continue
+		}
+		since, seen := track.nearSince[other.TrackID]
+		if otherSince, ok := other.nearSince[track.TrackID]; ok && (!seen || otherSince.Before(since)) {
+			since, seen = otherSince, true
+		}
+		if !seen {
+			since = point.ObservedAt
+			if last.ObservedAt.Before(since) {
+				since = last.ObservedAt
+			}
+		}
+		track.nearSince[other.TrackID] = since
+		other.nearSince[track.TrackID] = since
+	}
+}
+
+// newTrack builds an empty track with initialized rule state.
+func newTrack(trackID string, classification isr.Classification) *Track {
+	return &Track{
+		TrackID: trackID, Classification: classification,
+		zoneEnter: make(map[string]time.Time), loiterAlerted: make(map[string]bool),
+		nearSince: make(map[string]time.Time), rendezAlerted: make(map[string]bool),
+	}
 }
 
 // associate returns the track for the detection: the MMSI-bound track when
@@ -285,11 +394,7 @@ func (engine *Engine) associate(detection isr.Detection, position geo.Position) 
 	if best != nil {
 		return best
 	}
-	track := &Track{
-		TrackID: engine.newID(), Classification: detection.Classification,
-		zoneEnter: make(map[string]time.Time), loiterAlerted: make(map[string]bool),
-		nearSince: make(map[string]time.Time), rendezAlerted: make(map[string]bool),
-	}
+	track := newTrack(engine.newID(), detection.Classification)
 	engine.tracks[track.TrackID] = track
 	if detection.MMSI != "" {
 		track.MMSI = detection.MMSI

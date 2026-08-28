@@ -161,15 +161,45 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("fusion engine: %w", err)
 	}
+	trackStore := tracks.NewStore(store.Pool())
+	// Rebuild fusion engine state before serving: replay every persisted
+	// track association (in observation order) through Engine.Replay so track
+	// identities, points and rule bookkeeping survive a restart and
+	// GET /v1/isr/tracks serves the pre-restart state immediately. New track
+	// IDs are UUID-based, so a post-restart engine can never collide with a
+	// persisted track identity. Fail-closed: a replay failure aborts startup
+	// rather than serving an amnesiac or corrupted track view.
+	if err := replayTrackAssociations(ctx, trackStore, fusion); err != nil {
+		return err
+	}
 	outcomeService, closeTigerBeetle, err := loadOutcomeService(ctx)
 	if err != nil {
 		return err
 	}
 	defer closeTigerBeetle()
+	scanInterval, scanEnabled, err := darkVesselScanInterval(os.Getenv("ISR_DARK_VESSEL_SCAN_INTERVAL"))
+	if err != nil {
+		return err
+	}
+	if scanEnabled {
+		scanner, err := tracks.NewDarkVesselScanner(fusion, trackStore, scanInterval, nil)
+		if err != nil {
+			return fmt.Errorf("dark-vessel scanner: %w", err)
+		}
+		go func() {
+			if err := scanner.Run(ctx); err != nil {
+				log.Printf("maritime-intelligence: dark-vessel scanner stopped: %v", err)
+			}
+		}()
+		log.Printf("maritime-intelligence: dark-vessel scanner every %s", scanInterval)
+	} else {
+		log.Printf("maritime-intelligence: dark-vessel scanner disabled (ISR_DARK_VESSEL_SCAN_INTERVAL=0)")
+	}
 	isrDeps := &server.ISRDeps{
-		ISRStore:   isr.NewStore(store.Pool()),
-		TrackStore: tracks.NewStore(store.Pool()),
-		Fusion:     fusion,
+		ISRStore:        isr.NewStore(store.Pool()),
+		TrackStore:      trackStore,
+		Fusion:          fusion,
+		FusionErrorHook: telemetryPipeline.RecordFusionIngestError,
 	}
 	if outcomeService != nil {
 		outcomeStore, err := ledger.NewOutcomeStore(store.Pool(), outcomeService)
@@ -206,6 +236,49 @@ func run() error {
 		return fmt.Errorf("serve: %w", err)
 	}
 	return nil
+}
+
+// replayTrackAssociations rebuilds fusion engine state from the persisted
+// association audit before the server accepts traffic. Every association is
+// replayed with its original persisted track identity; a decode or replay
+// failure aborts startup fail-closed.
+func replayTrackAssociations(ctx context.Context, trackStore *tracks.Store, fusion *tracks.Engine) error {
+	replays, err := trackStore.ListAssociationsForReplay(ctx)
+	if err != nil {
+		return fmt.Errorf("reload track associations: %w", err)
+	}
+	for _, replay := range replays {
+		detection, err := isr.DecodeDetection(replay.Payload)
+		if err != nil {
+			return fmt.Errorf("reload track association %s: retained detection undecodable: %w", replay.TrackID, err)
+		}
+		if err := fusion.Replay(replay.TrackID, detection); err != nil {
+			return fmt.Errorf("replay track association %s: %w", replay.TrackID, err)
+		}
+	}
+	if len(replays) > 0 {
+		log.Printf("maritime-intelligence: restored %d track associations into %d fused tracks", len(replays), len(fusion.Tracks()))
+	}
+	return nil
+}
+
+// darkVesselScanInterval parses ISR_DARK_VESSEL_SCAN_INTERVAL. Unset selects
+// the default; the explicit value "0" is the only way to disable the scanner;
+// anything else that is not a positive duration fails closed at startup.
+func darkVesselScanInterval(value string) (time.Duration, bool, error) {
+	const defaultInterval = time.Minute
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return defaultInterval, true, nil
+	}
+	if value == "0" {
+		return 0, false, nil
+	}
+	parsed, err := time.ParseDuration(value)
+	if err != nil || parsed <= 0 {
+		return 0, false, fmt.Errorf("ISR_DARK_VESSEL_SCAN_INTERVAL must be a positive duration or 0 to disable: %q", value)
+	}
+	return parsed, true, nil
 }
 
 func requiredEnv(name string) string {

@@ -62,10 +62,21 @@ func (server *Server) admitDetection(response http.ResponseWriter, request *http
 		return
 	}
 	// Fusion runs after durable admission; replayed admissions must not
-	// duplicate associations or anomalies.
+	// duplicate associations or anomalies. A fusion failure never fails the
+	// request (admission is already durable and the startup replay rebuilds
+	// engine state), but it is always logged and counted — never swallowed.
 	if !admission.Replayed && server.isr.Fusion != nil && detection.HasPosition {
 		trackID, anomalies, fusionErr := server.isr.Fusion.Ingest(request.Context(), detection)
-		if fusionErr == nil && server.isr.TrackStore != nil {
+		if fusionErr != nil {
+			// Classified-data discipline: identifiers and labels only, never
+			// track content.
+			server.logger.ErrorContext(request.Context(), "isr fusion ingest failed after durable admission",
+				"event_id", detection.EventID, "source_id", detection.SourceID,
+				"classification", string(detection.Classification), "error", fusionErr.Error())
+			if server.isr.FusionErrorHook != nil {
+				server.isr.FusionErrorHook(request.Context())
+			}
+		} else if server.isr.TrackStore != nil {
 			track, ok := server.isr.Fusion.Track(trackID)
 			if ok {
 				if recordErr := server.isr.TrackStore.RecordFusion(request.Context(), track, detection, anomalies); recordErr != nil {

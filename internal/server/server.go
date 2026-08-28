@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -21,6 +22,7 @@ type Server struct {
 	authenticator Authenticator
 	readyzCheck   func(ctx context.Context) error
 	metrics       http.Handler
+	logger        *slog.Logger
 }
 
 // ISRDeps carries the Workstream F dependencies. Nil fields disable the
@@ -30,6 +32,10 @@ type ISRDeps struct {
 	TrackStore *tracks.Store
 	Fusion     *tracks.Engine
 	Outcomes   *ledger.OutcomeStore
+	// FusionErrorHook counts fusion ingest failures observed after durable
+	// detection admission (metric hook); nil disables the counter, never the
+	// structured log.
+	FusionErrorHook func(ctx context.Context)
 }
 
 // Config binds the HTTP surface. Authenticator is mandatory (fail-closed);
@@ -40,10 +46,15 @@ type Config struct {
 	Authenticator Authenticator
 	ReadyzCheck   func(ctx context.Context) error
 	Metrics       http.Handler
+	Logger        *slog.Logger
 }
 
 func New(config Config) http.Handler {
-	server := &Server{store: config.Store, isr: config.ISR, authenticator: config.Authenticator, readyzCheck: config.ReadyzCheck, metrics: config.Metrics}
+	logger := config.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	server := &Server{store: config.Store, isr: config.ISR, authenticator: config.Authenticator, readyzCheck: config.ReadyzCheck, metrics: config.Metrics, logger: logger}
 	api := http.NewServeMux()
 	api.HandleFunc("POST /v1/incidents", server.create)
 	api.HandleFunc("POST /v1/feed-sources", server.registerFeedSource)

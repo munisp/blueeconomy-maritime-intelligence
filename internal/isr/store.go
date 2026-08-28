@@ -171,10 +171,12 @@ func (store *Store) AdmitDetection(ctx context.Context, request SignedDetectionR
 	if err != nil {
 		return Detection{}, DetectionAdmission{}, err
 	}
+	// The outbox row keeps the record-level clearance label (DB CHECK); the
+	// payload column carries the canonical envelope document verbatim.
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO maritime_isr_outbox (event_id, topic, event_type, classification, aggregate_key, payload, created_at)
 		VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-		uuid.New(), envelope.Topic, envelope.EventType, string(envelope.Classification), envelope.AggregateKey, envelopeBytes, receivedAt); err != nil {
+		uuid.New(), envelope.Topic, envelope.EventType, string(envelope.Clearance), envelope.AggregateKey, envelopeBytes, receivedAt); err != nil {
 		return Detection{}, DetectionAdmission{}, fmt.Errorf("write detection outbox event: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {

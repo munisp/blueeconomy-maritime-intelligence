@@ -48,12 +48,47 @@ with 409.
   (boundary-inclusive polygon containment ported from
   `blueeconomy-waterway-safety/src/geo.rs`). Detection latency is recorded to
   the `isr.anomaly.detection.latency` histogram for the p99 ≤ 5s KPI.
+  **Restart discipline.** Before serving, the service rebuilds engine state
+  by replaying every persisted `maritime_track_associations` row (joined to
+  its retained detection, in observation order) through `Engine.Replay`,
+  which pins the original persisted track identity — `GET /v1/isr/tracks`
+  serves the pre-restart state immediately. New fused-track IDs are
+  UUID-based (`fused-track-<uuid>`), so a post-restart engine can never mint
+  an ID that collides with a persisted track. A replay failure aborts
+  startup fail-closed. Rule alert flags reset on restart, so a still-active
+  anomaly may re-fire once (fail-safe direction). The dark-vessel rule runs
+  from a ticker-driven scanner (`ISR_DARK_VESSEL_SCAN_INTERVAL`, default
+  `1m`, `0` disables explicitly); emitted anomalies are persisted with their
+  `maritime.behaviour.v1` outbox envelopes in the same transaction.
 - **Temporal workflow.** `ISRResponseWorkflow`
   (alert → classification by an analyst whose clearance must cover the alert
   → NN officer dispatch → interdiction → outcome capture) with an audit hook
   on every transition and observer queries (`isr.state`, `isr.history`).
   Activities are injected; the testsuite covers the happy path, clearance
-  rejection, unconfirmed alerts and audit-failure propagation.
+  rejection, unconfirmed alerts, audit-failure propagation and startability
+  from an admitted anomaly payload. See the starter contract below.
+
+### ISR response workflow starter contract
+
+`cmd/isr-worker` hosts `ISRResponseWorkflow` on the `TEMPORAL_TASK_QUEUE`
+task queue (fail-closed on `TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`,
+`TEMPORAL_TASK_QUEUE`). The HTTP admission path deliberately stays
+Temporal-free: an external starter (alerting rail, security-operations
+bridge, or operator tooling) starts one workflow instance per admitted
+behaviour anomaly with:
+
+- **Workflow:** `ISRResponseWorkflow` (registered under that exact name).
+- **Workflow ID:** the anomaly ID (idempotent start per anomaly).
+- **Input:** `workflow.AlertInput{AlertID, AnomalyID, Classification}` mapped
+  from the persisted `maritime_behaviour_anomalies` record — `AlertID` and
+  `AnomalyID` both set to the anomaly ID, `Classification` to the record's
+  clearance label. `internal/workflow/isr_starter_test.go` proves the
+  workflow is startable with exactly this payload.
+- **Signals:** `isr.classification`, `isr.dispatch`, `isr.interdiction`,
+  `isr.outcome`; **queries:** `isr.state`, `isr.history`.
+- **Side effects:** audit/outcome envelopes are appended to
+  `maritime_isr_outbox` by the worker's activities and drained by the
+  outbox publisher.
 - **Outcome ledger.** Incident-reduction metrics bind to premium-delta
   evidence through TigerBeetle transfers between two platform accounts.
   Posting is dual-control (`proposed_by` ≠ `confirmed_by`, enforced in the
@@ -61,11 +96,19 @@ with 409.
   UPDATE/DELETE trigger, same pattern as financial-controls cvff_approvals),
   and configuration is fail-closed (no outcome confirmation without a
   TigerBeetle client).
-- **Events.** Platform envelope v1.0 via the transactional outbox to
+- **Events.** Canonical platform envelope v1.0
+  (`blueeconomy.contracts.v1.EventEnvelope`, the same camelCase +
+  FHIR-message-bundle + provenance shape sealed by the ferry-ticketing and
+  financial-controls producers) via the transactional outbox to
   `maritime.isr.v1`, `maritime.behaviour.v1` and `maritime.outcome.v1`. The
-  envelope classification must match the event label; mismatches are rejected
-  at seal time. The outbox publisher runs in `OUTBOX_SOURCE=isr` mode and
-  routes each event to the topic recorded on its row.
+  outbox payload column carries the encoded envelope document verbatim.
+  Clearance labels map onto the platform `EnvelopeClassification` set
+  (`UNCLASSIFIED→INTERNAL`, `RESTRICTED→RESTRICTED`, `CONFIDENTIAL→CONFIDENTIAL`,
+  `SECRET→CONFIDENTIAL` — never widening); the original clearance label rides
+  as record-level metadata (`clearance`) inside the FHIR bundle entry, and
+  the envelope/payload classification match is enforced fail-closed at seal
+  time. The outbox publisher runs in `OUTBOX_SOURCE=isr` mode and routes each
+  event to the topic recorded on its row.
 - **Cross-cluster correlation.** Anomaly payloads carry `correlation_refs`
   (`wsb:ferries.telemetry:<id>`, `wse:fisheries-eez:<id>`) for
   security-operations' `cross-workstream-correlation` rule; see
@@ -102,9 +145,12 @@ Required: `DATABASE_URL`, `MIGRATION_PATH` (comma-separated, in order),
 `OIDC_AUDIENCE`, `OIDC_JWKS_URL` (https), optional `OIDC_CA_FILE`,
 `OIDC_ROLES_CLIENT_IDS`. Fusion zones load from `ISR_ZONES_FILE` (JSON array
 of `{zone_id, zone_kind, vertices}`; absent file means no zones, malformed
-file fails startup). `TIGERBEETLE_ADDRESS` enables the outcome ledger
-(optional `TIGERBEETLE_CLUSTER_ID`); unset disables the outcome routes with
-503 rather than fabricating evidence. The service has no in-memory fallback.
+file fails startup). `ISR_DARK_VESSEL_SCAN_INTERVAL` sets the dark-vessel
+scan cadence (default `1m`; `0` disables explicitly; any other non-positive
+or unparsable value fails startup). `TIGERBEETLE_ADDRESS` enables the outcome
+ledger (optional `TIGERBEETLE_CLUSTER_ID`); unset disables the outcome routes
+with 503 rather than fabricating evidence. The service has no in-memory
+fallback.
 
 ## Local verification
 
@@ -128,7 +174,8 @@ go build ./... && go vet ./... && go test -race ./...
 ## Current boundary
 
 Real S2 casework plus the Workstream F ISR analytics foundation. Track fusion
-state is held in-process (snapshots, associations and anomalies are
-persisted); rebuilding engine state from retained detections on restart is
-follow-up work. Remaining: deployed geospatial storage (PostGIS), external
-notification rails, retention policy and Ministry acceptance.
+state is held in-process and rebuilt on startup from the persisted
+association audit (track identities are pinned; new IDs are UUID-based and
+cannot collide with persisted ones). Remaining: deployed geospatial storage
+(PostGIS), external notification rails, retention policy and Ministry
+acceptance.

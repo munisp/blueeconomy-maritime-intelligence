@@ -76,20 +76,18 @@ type outcomeRecordedEvent struct {
 type outboxActivities struct{ pool *pgxpool.Pool }
 
 func (activities *outboxActivities) appendOutbox(ctx context.Context, topic, eventType, aggregateKey string, payload any) error {
-	envelope, _, err := isr.Seal(topic, eventType, aggregateKey, isr.ClassificationRestricted, time.Now().UTC(), payload)
+	occurredAt := time.Now().UTC()
+	envelope, encoded, err := isr.Seal(topic, eventType, aggregateKey, isr.ClassificationRestricted, occurredAt, payload)
 	if err != nil {
 		return err
 	}
-	// The outbox payload column carries the encoded envelope; the publisher
-	// delivers it verbatim to Kafka.
-	encoded, err := envelope.Marshal()
-	if err != nil {
-		return fmt.Errorf("encode envelope: %w", err)
-	}
+	// The outbox payload column carries the canonical encoded envelope; the
+	// publisher delivers it verbatim to Kafka. The classification column keeps
+	// the record-level clearance label (DB CHECK).
 	if _, err := activities.pool.Exec(ctx, `
 		INSERT INTO maritime_isr_outbox (event_id, topic, event_type, classification, aggregate_key, payload, created_at)
 		VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-		uuid.New(), envelope.Topic, envelope.EventType, string(envelope.Classification), envelope.AggregateKey, encoded, envelope.OccurredAt); err != nil {
+		uuid.New(), envelope.Topic, envelope.EventType, string(envelope.Clearance), envelope.AggregateKey, encoded, occurredAt); err != nil {
 		return fmt.Errorf("write %s outbox event: %w", eventType, err)
 	}
 	return nil
