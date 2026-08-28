@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/munisp/blueeconomy-maritime-intelligence/internal/incident"
+	"github.com/munisp/blueeconomy-maritime-intelligence/internal/provenance"
 )
 
 var (
@@ -30,10 +31,20 @@ var (
 
 // Store persists ISR events, fused-track audit and anomalies and enforces
 // clearance-based reads at the service layer.
-type Store struct{ pool *pgxpool.Pool }
+type Store struct {
+	pool   *pgxpool.Pool
+	signer *provenance.Signer
+}
 
 // NewStore binds the store to an existing pool.
 func NewStore(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
+
+// WithSigner attaches the provenance signer used to seal every emitted
+// envelope. Emission paths fail closed when no signer is attached.
+func (store *Store) WithSigner(signer *provenance.Signer) *Store {
+	store.signer = signer
+	return store
+}
 
 // SignedDetectionRequest is one signature-verified multi-modal detection
 // admission. Payload is the canonical JSON encoding of Detection.
@@ -167,7 +178,7 @@ func (store *Store) AdmitDetection(ctx context.Context, request SignedDetectionR
 	if err != nil {
 		return Detection{}, DetectionAdmission{}, fmt.Errorf("record detection: %w", err)
 	}
-	envelope, envelopeBytes, err := Seal(TopicISR, "isr.detection_admitted", detection.EventID, detection.Classification, receivedAt, detection)
+	envelope, envelopeBytes, err := Seal(store.signer, TopicISR, "isr.detection_admitted", detection.EventID, detection.Classification, receivedAt, detection)
 	if err != nil {
 		return Detection{}, DetectionAdmission{}, err
 	}

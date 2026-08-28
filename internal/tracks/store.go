@@ -12,15 +12,26 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/munisp/blueeconomy-maritime-intelligence/internal/isr"
+	"github.com/munisp/blueeconomy-maritime-intelligence/internal/provenance"
 )
 
 // Store persists fused-track snapshots, association audit records and
 // behaviour anomalies, and emits maritime.behaviour.v1 envelopes through the
 // ISR outbox in the same transaction.
-type Store struct{ pool *pgxpool.Pool }
+type Store struct {
+	pool   *pgxpool.Pool
+	signer *provenance.Signer
+}
 
 // NewStore binds the store to an existing pool.
 func NewStore(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
+
+// WithSigner attaches the provenance signer used to seal every emitted
+// envelope. Emission paths fail closed when no signer is attached.
+func (store *Store) WithSigner(signer *provenance.Signer) *Store {
+	store.signer = signer
+	return store
+}
 
 // RecordFusion atomically upserts the track snapshot, records the
 // association audit for the ingested detection and persists every emitted
@@ -57,7 +68,7 @@ func (store *Store) RecordFusion(ctx context.Context, track Track, detection isr
 		return fmt.Errorf("record association audit: %w", err)
 	}
 	for _, anomaly := range anomalies {
-		if err := recordAnomalyInTransaction(ctx, tx, anomaly); err != nil {
+		if err := recordAnomalyInTransaction(ctx, tx, store.signer, anomaly); err != nil {
 			return err
 		}
 	}
@@ -79,7 +90,7 @@ func (store *Store) RecordAnomalies(ctx context.Context, anomalies []Anomaly) er
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	for _, anomaly := range anomalies {
-		if err := recordAnomalyInTransaction(ctx, tx, anomaly); err != nil {
+		if err := recordAnomalyInTransaction(ctx, tx, store.signer, anomaly); err != nil {
 			return err
 		}
 	}
@@ -125,7 +136,7 @@ func (store *Store) ListAssociationsForReplay(ctx context.Context) ([]Associatio
 
 type txExec = pgx.Tx
 
-func recordAnomalyInTransaction(ctx context.Context, tx txExec, anomaly Anomaly) error {
+func recordAnomalyInTransaction(ctx context.Context, tx txExec, signer *provenance.Signer, anomaly Anomaly) error {
 	trackIDs, err := json.Marshal(anomaly.TrackIDs)
 	if err != nil {
 		return fmt.Errorf("encode anomaly track ids: %w", err)
@@ -146,7 +157,7 @@ func recordAnomalyInTransaction(ctx context.Context, tx txExec, anomaly Anomaly)
 	if tag.RowsAffected() == 0 {
 		return nil
 	}
-	envelope, envelopeBytes, err := isr.Seal(isr.TopicBehaviour, "behaviour."+string(anomaly.Kind), anomaly.AnomalyID, anomaly.Classification, anomaly.DetectedAt, anomaly)
+	envelope, envelopeBytes, err := isr.Seal(signer, isr.TopicBehaviour, "behaviour."+string(anomaly.Kind), anomaly.AnomalyID, anomaly.Classification, anomaly.DetectedAt, anomaly)
 	if err != nil {
 		return err
 	}

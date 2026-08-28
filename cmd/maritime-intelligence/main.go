@@ -19,6 +19,7 @@ import (
 	"github.com/munisp/blueeconomy-maritime-intelligence/internal/geo"
 	"github.com/munisp/blueeconomy-maritime-intelligence/internal/incident"
 	"github.com/munisp/blueeconomy-maritime-intelligence/internal/isr"
+	"github.com/munisp/blueeconomy-maritime-intelligence/internal/provenance"
 	"github.com/munisp/blueeconomy-maritime-intelligence/internal/ledger"
 	"github.com/munisp/blueeconomy-maritime-intelligence/internal/server"
 	"github.com/munisp/blueeconomy-maritime-intelligence/internal/telemetry"
@@ -161,7 +162,13 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("fusion engine: %w", err)
 	}
-	trackStore := tracks.NewStore(store.Pool())
+	// Fail-closed startup: without the producer provenance key no envelope
+	// may leave this service, so the process refuses to run at all.
+	signer, err := provenance.LoadSignerFromEnv(isr.SigningKeyID)
+	if err != nil {
+		return fmt.Errorf("load provenance signer: %w", err)
+	}
+	trackStore := tracks.NewStore(store.Pool()).WithSigner(signer)
 	// Rebuild fusion engine state before serving: replay every persisted
 	// track association (in observation order) through Engine.Replay so track
 	// identities, points and rule bookkeeping survive a restart and
@@ -196,7 +203,7 @@ func run() error {
 		log.Printf("maritime-intelligence: dark-vessel scanner disabled (ISR_DARK_VESSEL_SCAN_INTERVAL=0)")
 	}
 	isrDeps := &server.ISRDeps{
-		ISRStore:        isr.NewStore(store.Pool()),
+		ISRStore:        isr.NewStore(store.Pool()).WithSigner(signer),
 		TrackStore:      trackStore,
 		Fusion:          fusion,
 		FusionErrorHook: telemetryPipeline.RecordFusionIngestError,
@@ -206,7 +213,7 @@ func run() error {
 		if err != nil {
 			return err
 		}
-		isrDeps.Outcomes = outcomeStore
+		isrDeps.Outcomes = outcomeStore.WithSigner(signer)
 	}
 	handler := telemetryPipeline.Middleware(server.New(server.Config{
 		Store:         store,

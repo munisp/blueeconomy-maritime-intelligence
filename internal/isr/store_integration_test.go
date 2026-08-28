@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/munisp/blueeconomy-maritime-intelligence/internal/incident"
+	"github.com/munisp/blueeconomy-maritime-intelligence/internal/provenance"
 )
 
 func openIntegrationStore(t *testing.T) (*Store, *incident.Store) {
@@ -42,7 +44,19 @@ func openIntegrationStore(t *testing.T) (*Store, *incident.Store) {
 			}
 		}
 	}
-	return NewStore(pool), incident.NewStore(pool)
+	signer, signerErr := provenance.NewSigner(SigningKeyID, testIntegrationKey(t))
+	if signerErr != nil {
+		t.Fatal(signerErr)
+	}
+	return NewStore(pool).WithSigner(signer), incident.NewStore(pool)
+}
+
+// testIntegrationKey derives a deterministic throwaway provenance key for
+// the emission path exercised by the integration suite.
+func testIntegrationKey(t *testing.T) ed25519.PrivateKey {
+	t.Helper()
+	seed := sha256.Sum256([]byte("maritime-intelligence-integration-provenance-key"))
+	return ed25519.NewKeyFromSeed(seed[:])
 }
 
 func signedDetection(t *testing.T, privateKey ed25519.PrivateKey, sourceID, eventID string, detection Detection) SignedDetectionRequest {

@@ -1,15 +1,19 @@
 package isr
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/munisp/blueeconomy-maritime-intelligence/internal/provenance"
 )
+
+// SigningKeyID is the provenance key id this producer signs envelopes with;
+// consumers resolve the matching public key from the fleet key directory.
+const SigningKeyID = "maritime-intelligence-1"
 
 // Platform event topics for Workstream F.
 const (
@@ -105,12 +109,18 @@ type eventClassificationProbe struct {
 	Classification string `json:"classification"`
 }
 
-// Seal builds one canonical platform envelope for an event payload. It fails
-// closed when the topic is unknown, the payload carries no valid
-// classification label, or the envelope classification would differ from the
-// payload's label. The returned bytes are the encoded envelope document —
-// what the outbox stores and the publisher delivers verbatim to Kafka.
-func Seal(topic, eventType, aggregateKey string, classification Classification, occurredAt time.Time, payload any) (Envelope, []byte, error) {
+// Seal builds one canonical platform envelope for an event payload and seals
+// it with the fleet provenance signature (JWS EdDSA over the
+// JCS-canonicalized envelope excluding the signature field). It fails closed
+// when the signer is missing, the topic is unknown, the payload carries no
+// valid classification label, or the envelope classification would differ
+// from the payload's label. The returned bytes are the encoded envelope
+// document — what the outbox stores and the publisher delivers verbatim to
+// Kafka.
+func Seal(signer *provenance.Signer, topic, eventType, aggregateKey string, classification Classification, occurredAt time.Time, payload any) (Envelope, []byte, error) {
+	if signer == nil {
+		return Envelope{}, nil, errors.New("provenance signer is required")
+	}
 	switch topic {
 	case TopicISR, TopicBehaviour, TopicOutcome:
 	default:
@@ -156,7 +166,6 @@ func Seal(topic, eventType, aggregateKey string, classification Classification, 
 	// envelope classification loses no handling detail.
 	resource["clearance"] = string(classification)
 	resource["aggregateKey"] = aggregateKey
-	digest := sha256.Sum256(payloadBytes)
 	envelope := Envelope{
 		EnvelopeVersion: EnvelopeVersion,
 		EventID:         uuid.NewString(),
@@ -172,7 +181,6 @@ func Seal(topic, eventType, aggregateKey string, classification Classification, 
 		Provenance: Provenance{
 			PrincipalID:      stringField(resource, "source_id", "alert_id", "anomaly_id"),
 			PrincipalRole:    stringField(resource, "modality", "kind"),
-			Signature:        hex.EncodeToString(digest[:]),
 			LedgerCommitHash: stringField(resource, "ledger_transfer_id", "incident_ref"),
 		},
 		Classification: envelopeClassification,
@@ -180,6 +188,11 @@ func Seal(topic, eventType, aggregateKey string, classification Classification, 
 		AggregateKey:   aggregateKey,
 		Clearance:      classification,
 	}
+	signature, err := signer.SignEnvelope(envelope)
+	if err != nil {
+		return Envelope{}, nil, fmt.Errorf("sign envelope provenance: %w", err)
+	}
+	envelope.Provenance.Signature = signature
 	envelopeBytes, err := envelope.Marshal()
 	if err != nil {
 		return Envelope{}, nil, fmt.Errorf("encode envelope: %w", err)

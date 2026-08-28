@@ -32,6 +32,7 @@ import (
 	sdkworkflow "go.temporal.io/sdk/workflow"
 
 	"github.com/munisp/blueeconomy-maritime-intelligence/internal/isr"
+	"github.com/munisp/blueeconomy-maritime-intelligence/internal/provenance"
 	isrworkflow "github.com/munisp/blueeconomy-maritime-intelligence/internal/workflow"
 )
 
@@ -73,11 +74,14 @@ type outcomeRecordedEvent struct {
 
 // outboxActivities persists workflow side effects into maritime_isr_outbox so
 // delivery to Kafka rides the existing transactional outbox publisher.
-type outboxActivities struct{ pool *pgxpool.Pool }
+type outboxActivities struct {
+	pool   *pgxpool.Pool
+	signer *provenance.Signer
+}
 
 func (activities *outboxActivities) appendOutbox(ctx context.Context, topic, eventType, aggregateKey string, payload any) error {
 	occurredAt := time.Now().UTC()
-	envelope, encoded, err := isr.Seal(topic, eventType, aggregateKey, isr.ClassificationRestricted, occurredAt, payload)
+	envelope, encoded, err := isr.Seal(activities.signer, topic, eventType, aggregateKey, isr.ClassificationRestricted, occurredAt, payload)
 	if err != nil {
 		return err
 	}
@@ -153,7 +157,13 @@ func run(logger *slog.Logger) error {
 	}
 	defer temporalClient.Close()
 
-	durable := &outboxActivities{pool: pool}
+	// Fail-closed startup: without the producer provenance key this worker
+	// must not emit any envelope.
+	signer, err := provenance.LoadSignerFromEnv(isr.SigningKeyID)
+	if err != nil {
+		return fmt.Errorf("load provenance signer: %w", err)
+	}
+	durable := &outboxActivities{pool: pool, signer: signer}
 	activities := &isrworkflow.Activities{
 		AuditTransition: durable.auditTransition,
 		RecordOutcome:   durable.recordOutcome,

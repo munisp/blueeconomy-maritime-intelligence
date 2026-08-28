@@ -1,12 +1,43 @@
 package isr
 
 import (
+	"crypto/ed25519"
 	"encoding/json"
+	"fmt"
 	"sort"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/munisp/blueeconomy-maritime-intelligence/internal/provenance"
 )
+
+// testSigner returns a throwaway provenance signer for envelope tests.
+func testSigner(t *testing.T) *provenance.Signer {
+	t.Helper()
+	_, private, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := provenance.NewSigner(SigningKeyID, private)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return signer
+}
+
+// requireValidSignature verifies the sealed envelope provenance signature
+// against the signer's public key.
+func requireValidSignature(t *testing.T, signer *provenance.Signer, envelopeBytes []byte) {
+	t.Helper()
+	directory, err := provenance.ParseDirectory([]byte(fmt.Sprintf(`{%q:%q}`, signer.KeyID(), signer.PublicKey())))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := directory.VerifyEnvelope(envelopeBytes); err != nil {
+		t.Fatalf("sealed envelope signature does not verify: %v", err)
+	}
+}
 
 type labelledPayload struct {
 	Classification Classification `json:"classification"`
@@ -43,7 +74,7 @@ type canonicalEnvelopeFixture struct {
 func TestSealEnvelopeClassificationMatch(t *testing.T) {
 	occurred := time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC)
 	payload := labelledPayload{Classification: ClassificationRestricted, Note: "detection admitted"}
-	envelope, envelopeBytes, err := Seal(TopicISR, "isr.detection_admitted", "evt-001", ClassificationRestricted, occurred, payload)
+	envelope, envelopeBytes, err := Seal(testSigner(t), TopicISR, "isr.detection_admitted", "evt-001", ClassificationRestricted, occurred, payload)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +103,8 @@ func TestSealEnvelopeClassificationMatch(t *testing.T) {
 func TestSealConformanceCanonicalContract(t *testing.T) {
 	occurred := time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC)
 	payload := labelledPayload{Classification: ClassificationSecret, Note: "track fused"}
-	_, envelopeBytes, err := Seal(TopicBehaviour, "behaviour.dark-vessel", "anomaly-001", ClassificationSecret, occurred, payload)
+	signer := testSigner(t)
+	_, envelopeBytes, err := Seal(signer, TopicBehaviour, "behaviour.dark-vessel", "anomaly-001", ClassificationSecret, occurred, payload)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,6 +150,7 @@ func TestSealConformanceCanonicalContract(t *testing.T) {
 	if fixture.Provenance.Signature == "" {
 		t.Fatal("provenance signature is required")
 	}
+	requireValidSignature(t, signer, envelopeBytes)
 	switch fixture.Classification {
 	case EnvelopeClassificationConfidential, EnvelopeClassificationRestricted,
 		EnvelopeClassificationInternal, EnvelopeClassificationPublic, EnvelopeClassificationFiduciary:
@@ -150,19 +183,19 @@ func TestEnvelopeClassificationMapping(t *testing.T) {
 func TestSealFailsClosedOnMismatch(t *testing.T) {
 	occurred := time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC)
 	payload := labelledPayload{Classification: ClassificationSecret, Note: "track fused"}
-	if _, _, err := Seal(TopicBehaviour, "behaviour.anomaly", "track-1", ClassificationUnclassified, occurred, payload); err == nil {
+	if _, _, err := Seal(testSigner(t), TopicBehaviour, "behaviour.anomaly", "track-1", ClassificationUnclassified, occurred, payload); err == nil {
 		t.Fatal("envelope/payload classification mismatch accepted")
 	}
-	if _, _, err := Seal("maritime.unknown.v1", "x", "k", ClassificationSecret, occurred, payload); err == nil {
+	if _, _, err := Seal(testSigner(t), "maritime.unknown.v1", "x", "k", ClassificationSecret, occurred, payload); err == nil {
 		t.Fatal("unapproved topic accepted")
 	}
 	unlabelled := struct {
 		Note string `json:"note"`
 	}{Note: "no label"}
-	if _, _, err := Seal(TopicISR, "isr.x", "k", ClassificationUnclassified, occurred, unlabelled); err == nil {
+	if _, _, err := Seal(testSigner(t), TopicISR, "isr.x", "k", ClassificationUnclassified, occurred, unlabelled); err == nil {
 		t.Fatal("payload without classification label sealed")
 	}
-	if _, _, err := Seal(TopicISR, "isr.x", "k", "BOGUS", occurred, payload); err == nil {
+	if _, _, err := Seal(testSigner(t), TopicISR, "isr.x", "k", "BOGUS", occurred, payload); err == nil {
 		t.Fatal("invalid envelope classification accepted")
 	}
 }

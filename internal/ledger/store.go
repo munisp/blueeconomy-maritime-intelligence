@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/munisp/blueeconomy-maritime-intelligence/internal/isr"
+	"github.com/munisp/blueeconomy-maritime-intelligence/internal/provenance"
 )
 
 var (
@@ -77,6 +78,7 @@ func (proposal Proposal) Validate() error {
 type OutcomeStore struct {
 	pool    *pgxpool.Pool
 	service *Service
+	signer  *provenance.Signer
 }
 
 // NewOutcomeStore fails closed without a pool or a TigerBeetle service.
@@ -88,6 +90,13 @@ func NewOutcomeStore(pool *pgxpool.Pool, service *Service) (*OutcomeStore, error
 		return nil, errors.New("TigerBeetle outcome service is required (fail-closed)")
 	}
 	return &OutcomeStore{pool: pool, service: service}, nil
+}
+
+// WithSigner attaches the provenance signer used to seal every emitted
+// envelope. Emission paths fail closed when no signer is attached.
+func (store *OutcomeStore) WithSigner(signer *provenance.Signer) *OutcomeStore {
+	store.signer = signer
+	return store
 }
 
 // Propose records one outcome proposal. Exact replay returns the retained
@@ -183,7 +192,7 @@ func (store *OutcomeStore) Confirm(ctx context.Context, entryID, confirmedBy str
 	if _, err := tx.Exec(ctx, `UPDATE maritime_outcome_ledger_proposals SET state='CONFIRMED' WHERE entry_id=$1 AND state='PROPOSED'`, entryID); err != nil {
 		return Entry{}, fmt.Errorf("close outcome proposal: %w", err)
 	}
-	envelope, envelopeBytes, err := isr.Seal(isr.TopicOutcome, "outcome."+string(proposal.EntryKind), proposal.EntryID, proposal.Classification, confirmedAt, entry)
+	envelope, envelopeBytes, err := isr.Seal(store.signer, isr.TopicOutcome, "outcome."+string(proposal.EntryKind), proposal.EntryID, proposal.Classification, confirmedAt, entry)
 	if err != nil {
 		return Entry{}, err
 	}
