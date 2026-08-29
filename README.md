@@ -123,11 +123,30 @@ edge-asserted `X-Authenticated-Roles` (comma-separated) and
 RS256 bearer tokens against `OIDC_JWKS_URL` (issuer/audience pinned, JWKS
 redirects forbidden, keys refreshed on unknown `kid`), reading roles from
 `realm_access.roles`/configured `resource_access` clients and clearance from
-the `clearance` claim. Recognized roles: `nimasa-officer`,
+the `clearance` claim. Recognized read-side roles: `nimasa-officer`,
 `defence-hq-observer`, `nn-officer`, `onsa-observer`, `marine-police`,
 `fleet-operator`, `insurer-aggregator` (read-only, aggregates only) and
-`auditor`. Observer/auditor/insurer roles are denied every mutating route
-generically. Any other `AUTH_MODE` fails closed at startup and per request.
+`auditor`. Every mutating route is additionally gated on a designated
+verified-token role (authoritative table in `internal/server/access.go`):
+`isr-admin` for feed-source administration (register/activate/revoke/
+rotate-key), `isr-feed-ingest` for signed feed event/incident admission and
+`detections:admit`, `isr-analyst`/`isr-watch-officer` for incident
+create/correlate/assign/transition (including SOS acknowledge),
+`isr-analyst` for outcome proposals and `isr-adjudicator` for outcome
+confirmations (preserving proposer≠confirmer dual control). Authorization
+fails closed: absent, unrecognized or read-only roles are denied every
+mutation with 403. Any other `AUTH_MODE` fails closed at startup and per
+request.
+
+Feed-source trust is maker-checker: `POST /v1/feed-sources` always creates
+the source PENDING (`active:true` in the body is rejected) with the
+verified token subject recorded as registrar, and
+`POST /v1/feed-sources/{source_id}/activate` requires a distinct
+`isr-admin` principal. Signed feed admission accepts only ACTIVE sources;
+trust denials (unknown source, non-active source, invalid signature) are
+audit-logged in `maritime_feed_admission_denials`. Revocation/key-rotation
+audit attribution always comes from the verified token subject — body
+`revoked_by`/`rotated_by` fields are ignored.
 
 `/healthz` and `/readyz` (database ping) are unauthenticated; `/metrics`
 serves the local Prometheus registry (including the anomaly-detection
