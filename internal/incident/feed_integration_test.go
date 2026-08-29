@@ -28,7 +28,10 @@ func TestSignedFeedIncidentIsAtomicAgainstPostgreSQL(t *testing.T) {
 		t.Fatal(err)
 	}
 	sourceID := "radar-feed-incident"
-	if err := store.RegisterFeedSource(ctx, FeedSourceRegistration{SourceID: sourceID, SourceKind: "RADAR", Authority: "local-authority", PublicKey: publicKey, Active: true}); err != nil {
+	if err := store.RegisterFeedSource(ctx, FeedSourceRegistration{SourceID: sourceID, SourceKind: "RADAR", Authority: "local-authority", PublicKey: publicKey, RegisteredBy: "registrar-integration"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ActivateFeedSource(ctx, FeedSourceActivation{SourceID: sourceID, ActivatedBy: "activator-integration"}); err != nil {
 		t.Fatal(err)
 	}
 	eventID := "radar-event-incident-001"
@@ -100,7 +103,10 @@ func TestAuthorizedFeedAdmissionAgainstPostgreSQL(t *testing.T) {
 		t.Fatal(err)
 	}
 	sourceID := "ais-local-integration"
-	if err := store.RegisterFeedSource(ctx, FeedSourceRegistration{SourceID: sourceID, SourceKind: "AIS", Authority: "local-authority", PublicKey: publicKey, Active: true}); err != nil {
+	if err := store.RegisterFeedSource(ctx, FeedSourceRegistration{SourceID: sourceID, SourceKind: "AIS", Authority: "local-authority", PublicKey: publicKey, RegisteredBy: "registrar-integration"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ActivateFeedSource(ctx, FeedSourceActivation{SourceID: sourceID, ActivatedBy: "activator-integration"}); err != nil {
 		t.Fatal(err)
 	}
 	payload := []byte(`{"mmsi":"636019999","lat":6.45,"lon":3.39}`)
@@ -144,7 +150,10 @@ func TestFeedSourceRevocationAgainstPostgreSQL(t *testing.T) {
 		t.Fatal(err)
 	}
 	sourceID := "revocable-feed-integration"
-	if err := store.RegisterFeedSource(ctx, FeedSourceRegistration{SourceID: sourceID, SourceKind: "AIS", Authority: "local-authority", PublicKey: publicKey, Active: true}); err != nil {
+	if err := store.RegisterFeedSource(ctx, FeedSourceRegistration{SourceID: sourceID, SourceKind: "AIS", Authority: "local-authority", PublicKey: publicKey, RegisteredBy: "registrar-integration"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ActivateFeedSource(ctx, FeedSourceActivation{SourceID: sourceID, ActivatedBy: "activator-integration"}); err != nil {
 		t.Fatal(err)
 	}
 	revocation := FeedSourceRevocation{SourceID: sourceID, Reason: "key-compromise", RevokedBy: "security-operator"}
@@ -188,7 +197,10 @@ func TestFeedSourceKeyRotationAgainstPostgreSQL(t *testing.T) {
 		t.Fatal(err)
 	}
 	sourceID := "rotating-feed-integration"
-	if err := store.RegisterFeedSource(ctx, FeedSourceRegistration{SourceID: sourceID, SourceKind: "VTS", Authority: "local-authority", PublicKey: oldPublic, Active: true}); err != nil {
+	if err := store.RegisterFeedSource(ctx, FeedSourceRegistration{SourceID: sourceID, SourceKind: "VTS", Authority: "local-authority", PublicKey: oldPublic, RegisteredBy: "registrar-integration"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ActivateFeedSource(ctx, FeedSourceActivation{SourceID: sourceID, ActivatedBy: "activator-integration"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.RotateFeedSourceKey(ctx, FeedSourceKeyRotation{SourceID: sourceID, NewPublicKey: newPublic, GraceUntil: time.Now().UTC().Add(time.Hour), RotatedBy: "key-operator"}); err != nil {

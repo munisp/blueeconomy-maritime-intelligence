@@ -16,6 +16,25 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+var (
+	// ErrFeedSourceNotActive is returned when a feed admission references a
+	// source that is pending approval or has been revoked. Fail-closed: only
+	// ACTIVE sources may admit events.
+	ErrFeedSourceNotActive = errors.New("feed source is not active")
+	// ErrFeedSignatureInvalid is returned when the ed25519 signature over the
+	// canonical feed preimage verifies against neither the active key nor a
+	// prior key inside its grace window.
+	ErrFeedSignatureInvalid = errors.New("feed event signature verification failed")
+	// ErrMakerChecker is returned when the feed-source registrar attempts to
+	// activate its own registration; activation requires a distinct verified
+	// principal.
+	ErrMakerChecker = errors.New("maker-checker violation: registrar and activator must be distinct principals")
+	// ErrFeedSourceRevoked is returned when activation is attempted on a
+	// revoked (permanently retired) feed source.
+	ErrFeedSourceRevoked = errors.New("revoked feed source cannot be re-activated")
 )
 
 type FeedSourceRegistration struct {
@@ -23,7 +42,10 @@ type FeedSourceRegistration struct {
 	SourceKind string            `json:"source_kind"`
 	Authority  string            `json:"authority"`
 	PublicKey  ed25519.PublicKey `json:"public_key"`
-	Active     bool              `json:"active"`
+	// RegisteredBy is the verified principal that created the registration.
+	// It is never taken from the request body; callers bind the
+	// authenticated subject. Activation later requires a distinct principal.
+	RegisteredBy string `json:"registered_by"`
 }
 
 type FeedAdmissionRequest struct {
@@ -44,6 +66,9 @@ type FeedAdmission struct {
 func (registration FeedSourceRegistration) Validate() error {
 	if !incidentIDPattern.MatchString(registration.SourceID) || !incidentIDPattern.MatchString(registration.Authority) {
 		return errors.New("source_id and authority must be canonical identifiers")
+	}
+	if !incidentIDPattern.MatchString(registration.RegisteredBy) {
+		return errors.New("registered_by must be the verified registrar principal")
 	}
 	if registration.SourceKind != "AIS" && registration.SourceKind != "VTS" && registration.SourceKind != "RADAR" && registration.SourceKind != "PORT" && registration.SourceKind != "AGENCY" &&
 		registration.SourceKind != "SAR" && registration.SourceKind != "RF" && registration.SourceKind != "ACOUSTIC" && registration.SourceKind != "OPTICAL" {
@@ -79,13 +104,120 @@ func FeedSigningBytes(sourceID, eventID string, payload []byte) []byte {
 	return feedSigningBytes(sourceID, eventID, payload)
 }
 
+// RegisterFeedSource records a new feed source PENDING (active=false). A
+// registration can never activate a source — activation is a separate
+// maker-checker decision by a distinct verified principal
+// (ActivateFeedSource). Re-registering identical evidence is an idempotent
+// replay; re-registering with a different key, kind or authority fails
+// closed with ErrIdempotencyConflict instead of silently replacing the
+// trusted key material, and never re-activates a pending or revoked source.
 func (store *Store) RegisterFeedSource(ctx context.Context, registration FeedSourceRegistration) error {
 	if err := registration.Validate(); err != nil {
 		return err
 	}
 	digest := sha256.Sum256(registration.PublicKey)
-	_, err := store.pool.Exec(ctx, `INSERT INTO maritime_feed_sources (source_id, source_kind, authority, public_key, key_fingerprint, active, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$7) ON CONFLICT (source_id) DO UPDATE SET source_kind=EXCLUDED.source_kind, authority=EXCLUDED.authority, public_key=EXCLUDED.public_key, key_fingerprint=EXCLUDED.key_fingerprint, active=EXCLUDED.active, updated_at=EXCLUDED.updated_at`, registration.SourceID, registration.SourceKind, registration.Authority, []byte(registration.PublicKey), "sha256:"+hex.EncodeToString(digest[:]), registration.Active, time.Now().UTC())
-	return err
+	fingerprint := "sha256:" + hex.EncodeToString(digest[:])
+	now := time.Now().UTC()
+	var retainedID string
+	err := store.pool.QueryRow(ctx, `
+		INSERT INTO maritime_feed_sources (source_id, source_kind, authority, public_key, key_fingerprint, active, registered_by, created_at, updated_at)
+		VALUES ($1,$2,$3,$4,$5,false,$6,$7,$7)
+		ON CONFLICT (source_id) DO NOTHING
+		RETURNING source_id`,
+		registration.SourceID, registration.SourceKind, registration.Authority,
+		[]byte(registration.PublicKey), fingerprint, registration.RegisteredBy, now).Scan(&retainedID)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("register feed source: %w", err)
+	}
+	var retainedKind, retainedAuthority string
+	var retainedKey []byte
+	if err := store.pool.QueryRow(ctx, `SELECT source_kind, authority, public_key FROM maritime_feed_sources WHERE source_id=$1`, registration.SourceID).Scan(&retainedKind, &retainedAuthority, &retainedKey); err != nil {
+		return fmt.Errorf("load retained feed source: %w", err)
+	}
+	if retainedKind != registration.SourceKind || retainedAuthority != registration.Authority || !bytes.Equal(retainedKey, registration.PublicKey) {
+		return ErrIdempotencyConflict
+	}
+	return nil
+}
+
+// FeedSourceActivation is the maker-checker approval that turns a PENDING
+// feed source ACTIVE. ActivatedBy is the verified approving principal, which
+// must differ from the registrar recorded at registration.
+type FeedSourceActivation struct {
+	SourceID    string `json:"source_id"`
+	ActivatedBy string `json:"activated_by"`
+}
+
+func (request FeedSourceActivation) Validate() error {
+	if !incidentIDPattern.MatchString(request.SourceID) || !incidentIDPattern.MatchString(request.ActivatedBy) {
+		return errors.New("source_id and activated_by must be canonical identifiers")
+	}
+	return nil
+}
+
+// ActivateFeedSource activates a pending feed source under maker-checker
+// control: the activator must be a distinct verified principal from the
+// registrar, and the activation (registrar, activator, timestamp) is
+// persisted as durable audit evidence. Revoked sources are permanently
+// retired and cannot be re-activated. Repeating exactly the same activation
+// is idempotent; a conflicting activation fails with
+// ErrIdempotencyConflict.
+func (store *Store) ActivateFeedSource(ctx context.Context, request FeedSourceActivation) error {
+	if err := request.Validate(); err != nil {
+		return err
+	}
+	tx, err := store.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		return fmt.Errorf("begin feed source activation: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var registeredBy string
+	var active bool
+	if err := tx.QueryRow(ctx, `SELECT registered_by, active FROM maritime_feed_sources WHERE source_id=$1 FOR UPDATE`, request.SourceID).Scan(&registeredBy, &active); errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	} else if err != nil {
+		return fmt.Errorf("load feed source: %w", err)
+	}
+	var revoked bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM maritime_feed_source_revocations WHERE source_id=$1)`, request.SourceID).Scan(&revoked); err != nil {
+		return fmt.Errorf("load feed source revocation: %w", err)
+	}
+	if revoked {
+		return ErrFeedSourceRevoked
+	}
+	if request.ActivatedBy == registeredBy {
+		return ErrMakerChecker
+	}
+	if active {
+		var retainedBy string
+		err := tx.QueryRow(ctx, `SELECT activated_by FROM maritime_feed_source_activations WHERE source_id=$1`, request.SourceID).Scan(&retainedBy)
+		if err == nil {
+			if retainedBy != request.ActivatedBy {
+				return ErrIdempotencyConflict
+			}
+			return tx.Commit(ctx)
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("load feed source activation: %w", err)
+		}
+		// Legacy source activated before maker-checker existed: backfill the
+		// audit record so every active source has activation evidence.
+		if _, err := tx.Exec(ctx, `INSERT INTO maritime_feed_source_activations (source_id, registered_by, activated_by, activated_at) VALUES ($1,$2,$3,$4)`, request.SourceID, registeredBy, request.ActivatedBy, time.Now().UTC()); err != nil {
+			return fmt.Errorf("record feed source activation: %w", err)
+		}
+		return tx.Commit(ctx)
+	}
+	now := time.Now().UTC()
+	if _, err := tx.Exec(ctx, `INSERT INTO maritime_feed_source_activations (source_id, registered_by, activated_by, activated_at) VALUES ($1,$2,$3,$4)`, request.SourceID, registeredBy, request.ActivatedBy, now); err != nil {
+		return fmt.Errorf("record feed source activation: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE maritime_feed_sources SET active=true, updated_at=$2 WHERE source_id=$1`, request.SourceID, now); err != nil {
+		return fmt.Errorf("activate feed source: %w", err)
+	}
+	return tx.Commit(ctx)
 }
 
 // AdmitFeedEvent records one signed feed event inside a serializable
@@ -104,12 +236,57 @@ func (store *Store) AdmitFeedEvent(ctx context.Context, request FeedAdmissionReq
 	defer func() { _ = tx.Rollback(ctx) }()
 	admission, err := admitFeedEventInTransaction(ctx, tx, request)
 	if err != nil {
+		if auditErr := store.auditFeedAdmissionDenial(ctx, request, err); auditErr != nil {
+			return FeedAdmission{}, auditErr
+		}
 		return FeedAdmission{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return FeedAdmission{}, fmt.Errorf("commit feed event admission: %w", err)
 	}
 	return admission, nil
+}
+
+// feedDenialReason maps an admission failure to the auditable denial reason,
+// or "" when the failure is not a trust denial (validation, conflicts and
+// infrastructure errors are not audit-logged here).
+func feedDenialReason(err error) string {
+	switch {
+	case errors.Is(err, ErrNotFound):
+		return "source-unknown"
+	case errors.Is(err, ErrFeedSourceNotActive):
+		return "source-not-active"
+	case errors.Is(err, ErrFeedSignatureInvalid):
+		return "signature-invalid"
+	default:
+		return ""
+	}
+}
+
+// auditFeedAdmissionDenial durably records a rejected admission so forged or
+// premature feed attempts leave audit evidence. A failure to write the audit
+// record is itself reported (never swallowed); the admission stays denied.
+func (store *Store) auditFeedAdmissionDenial(ctx context.Context, request FeedAdmissionRequest, admissionErr error) error {
+	reason := feedDenialReason(admissionErr)
+	if reason == "" {
+		return nil
+	}
+	if err := RecordFeedAdmissionDenial(ctx, store.pool, request.SourceID, request.SourceEventID, reason); err != nil {
+		return fmt.Errorf("audit feed admission denial (%v): %w", admissionErr, err)
+	}
+	return nil
+}
+
+// RecordFeedAdmissionDenial appends one denial audit record. It is exported
+// so the ISR detection-admission path (internal/isr) records denials into
+// the same audit trail on the shared database.
+func RecordFeedAdmissionDenial(ctx context.Context, pool *pgxpool.Pool, sourceID, sourceEventID, reason string) error {
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO maritime_feed_admission_denials (denial_id, source_id, source_event_id, reason, denied_at)
+		VALUES ($1,$2,$3,$4,$5)`, uuid.NewString(), sourceID, sourceEventID, reason, time.Now().UTC()); err != nil {
+		return fmt.Errorf("record feed admission denial: %w", err)
+	}
+	return nil
 }
 
 func EncodeFeedSignature(sourceID, eventID string, payload []byte, privateKey ed25519.PrivateKey) string {
@@ -174,6 +351,9 @@ func (store *Store) AdmitFeedIncident(ctx context.Context, request SignedFeedInc
 	defer func() { _ = tx.Rollback(ctx) }()
 	admission, err := admitFeedEventInTransaction(ctx, tx, request.FeedAdmissionRequest)
 	if err != nil {
+		if auditErr := store.auditFeedAdmissionDenial(ctx, request.FeedAdmissionRequest, err); auditErr != nil {
+			return SignedFeedIncidentResult{}, auditErr
+		}
 		return SignedFeedIncidentResult{}, err
 	}
 	created, err := createIncidentInTransaction(ctx, tx, incidentRequest)
@@ -196,14 +376,14 @@ func admitFeedEventInTransaction(ctx context.Context, tx pgx.Tx, request FeedAdm
 		return FeedAdmission{}, fmt.Errorf("load feed source: %w", err)
 	}
 	if !active {
-		return FeedAdmission{}, errors.New("feed source is inactive")
+		return FeedAdmission{}, ErrFeedSourceNotActive
 	}
 	signingBytes := feedSigningBytes(request.SourceID, request.SourceEventID, request.Payload)
 	if !ed25519.Verify(ed25519.PublicKey(publicKey), signingBytes, request.Signature) {
 		var graceKey []byte
 		err := tx.QueryRow(ctx, `SELECT prior_public_key FROM maritime_feed_source_key_rotations WHERE source_id=$1 AND grace_until>$2 ORDER BY rotated_at DESC LIMIT 1`, request.SourceID, time.Now().UTC()).Scan(&graceKey)
 		if err != nil || !ed25519.Verify(ed25519.PublicKey(graceKey), signingBytes, request.Signature) {
-			return FeedAdmission{}, errors.New("feed event signature verification failed")
+			return FeedAdmission{}, ErrFeedSignatureInvalid
 		}
 	}
 	digest := sha256.Sum256(request.Payload)

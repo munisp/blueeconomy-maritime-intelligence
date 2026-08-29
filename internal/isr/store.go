@@ -95,6 +95,24 @@ func DecodeDetection(payload []byte) (Detection, error) {
 	return detection, nil
 }
 
+// auditDetectionDenial records a trust denial (unknown source, non-active
+// source, invalid signature) in the shared feed-admission denial audit trail
+// and returns the original denial error. A failure to write the audit record
+// is reported (never swallowed); the detection stays denied.
+func (store *Store) auditDetectionDenial(ctx context.Context, request SignedDetectionRequest, denialErr error) (Detection, DetectionAdmission, error) {
+	reason := "signature-invalid"
+	switch {
+	case errors.Is(denialErr, ErrNotFound):
+		reason = "source-unknown"
+	case errors.Is(denialErr, incident.ErrFeedSourceNotActive):
+		reason = "source-not-active"
+	}
+	if err := incident.RecordFeedAdmissionDenial(ctx, store.pool, request.SourceID, request.SourceEventID, reason); err != nil {
+		return Detection{}, DetectionAdmission{}, fmt.Errorf("audit detection admission denial (%v): %w", denialErr, err)
+	}
+	return Detection{}, DetectionAdmission{}, denialErr
+}
+
 // AdmitDetection verifies the feed source signature, enforces the mandatory
 // classification label, persists the detection, and writes the platform
 // envelope to the ISR outbox — atomically. Replay of an identical admission
@@ -122,19 +140,19 @@ func (store *Store) AdmitDetection(ctx context.Context, request SignedDetectionR
 	var fingerprint string
 	var active bool
 	if err := tx.QueryRow(ctx, `SELECT public_key, key_fingerprint, active FROM maritime_feed_sources WHERE source_id=$1 FOR SHARE`, request.SourceID).Scan(&publicKey, &fingerprint, &active); errors.Is(err, pgx.ErrNoRows) {
-		return Detection{}, DetectionAdmission{}, ErrNotFound
+		return store.auditDetectionDenial(ctx, request, ErrNotFound)
 	} else if err != nil {
 		return Detection{}, DetectionAdmission{}, fmt.Errorf("load feed source: %w", err)
 	}
 	if !active {
-		return Detection{}, DetectionAdmission{}, errors.New("feed source is inactive")
+		return store.auditDetectionDenial(ctx, request, incident.ErrFeedSourceNotActive)
 	}
 	signingBytes := incident.FeedSigningBytes(request.SourceID, request.SourceEventID, request.Payload)
 	if !ed25519.Verify(ed25519.PublicKey(publicKey), signingBytes, request.Signature) {
 		var graceKey []byte
 		err := tx.QueryRow(ctx, `SELECT prior_public_key FROM maritime_feed_source_key_rotations WHERE source_id=$1 AND grace_until>$2 ORDER BY rotated_at DESC LIMIT 1`, request.SourceID, time.Now().UTC()).Scan(&graceKey)
 		if err != nil || !ed25519.Verify(ed25519.PublicKey(graceKey), signingBytes, request.Signature) {
-			return Detection{}, DetectionAdmission{}, errors.New("detection signature verification failed")
+			return store.auditDetectionDenial(ctx, request, incident.ErrFeedSignatureInvalid)
 		}
 	}
 	digest := sha256.Sum256(request.Payload)

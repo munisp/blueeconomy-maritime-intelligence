@@ -283,6 +283,8 @@ func writeISRError(response http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, isr.ErrForbidden):
 		writeError(response, http.StatusForbidden, "insufficient role or clearance")
+	case errors.Is(err, incident.ErrFeedSourceNotActive), errors.Is(err, incident.ErrFeedSignatureInvalid):
+		writeError(response, http.StatusForbidden, err.Error())
 	case errors.Is(err, isr.ErrNotFound), errors.Is(err, ledger.ErrNotFound):
 		writeError(response, http.StatusNotFound, err.Error())
 	case errors.Is(err, isr.ErrConflict), errors.Is(err, ledger.ErrConflict):

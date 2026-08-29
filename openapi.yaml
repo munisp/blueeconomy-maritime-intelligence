@@ -32,9 +32,27 @@ paths:
   /v1/feed-sources:
     post:
       operationId: registerFeedSource
+      description: >
+        Registers a feed source PENDING (never self-activated): the request's
+        public key is not trusted until a distinct isr-admin principal
+        activates the source via /v1/feed-sources/{source_id}/activate
+        (maker-checker). The verified token subject is recorded as registrar;
+        a body carrying active:true is rejected with 400. Requires isr-admin.
       security: [{trustedProxy: []}, {bearerAuth: []}]
       requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/FeedSourceRegistration'}}}}
-      responses: {'201': {description: Source registered.}, '409': {description: Existing source conflict.}, '422': {description: Invalid source identity/key.}}
+      responses: {'201': {description: Source registered PENDING activation.}, '400': {description: Self-activation attempted or invalid key encoding.}, '403': {description: Missing isr-admin role.}, '409': {description: Conflicting re-registration evidence.}, '422': {description: Invalid source identity/key.}}
+  /v1/feed-sources/{source_id}/activate:
+    post:
+      operationId: activateFeedSource
+      description: >
+        Maker-checker activation of a PENDING feed source. The verified
+        isr-admin subject must differ from the registrar recorded at
+        registration; the activation (registrar, activator, timestamp) is
+        persisted as audit evidence. Revoked sources cannot be re-activated.
+        Exact replays are idempotent. Requires isr-admin.
+      security: [{trustedProxy: []}, {bearerAuth: []}]
+      parameters: [{$ref: '#/components/parameters/SourceID'}]
+      responses: {'200': {description: Source activated (or exact replay).}, '403': {description: Missing isr-admin role.}, '404': {description: Unknown source.}, '409': {description: Maker-checker violation (registrar == activator), revoked source, or conflicting activation.}}
   /v1/feed-sources/{source_id}/revoke:
     post:
       operationId: revokeFeedSource

@@ -1,11 +1,15 @@
 package server
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/munisp/blueeconomy-maritime-intelligence/internal/incident"
 	"github.com/munisp/blueeconomy-maritime-intelligence/internal/isr"
 )
 
@@ -25,6 +29,7 @@ func mutationCases() []mutationCase {
 		{"incident acknowledge (SOS)", "/v1/incidents/inc-1/acknowledge", []string{isr.RoleISRAnalyst, isr.RoleISRWatchOfficer}},
 		{"incident resolve", "/v1/incidents/inc-1/resolve", []string{isr.RoleISRAnalyst, isr.RoleISRWatchOfficer}},
 		{"feed-source register", "/v1/feed-sources", []string{isr.RoleISRAdmin}},
+		{"feed-source activate", "/v1/feed-sources/src-1/activate", []string{isr.RoleISRAdmin}},
 		{"feed-source revoke", "/v1/feed-sources/src-1/revoke", []string{isr.RoleISRAdmin}},
 		{"feed-source rotate-key", "/v1/feed-sources/src-1/rotate-key", []string{isr.RoleISRAdmin}},
 		{"feed event admit", "/v1/feed-events/admit", []string{isr.RoleISRFeedIngest}},
@@ -48,8 +53,20 @@ func loopbackRequest(method, path, subject, roles, body string) *http.Request {
 	return request
 }
 
-func newRoleTestHandler() http.Handler {
-	return New(Config{Authenticator: loopbackAuthenticator{}})
+// newRoleTestHandler builds the full HTTP surface with an incident store
+// bound to a lazily-dialing pool on a closed port: role gates and request
+// validation run normally, while any handler that legitimately reaches the
+// store (e.g. feed-source activation, which has no request body) fails fast
+// with a connection error instead of a nil dereference. pgxpool.New does not
+// dial eagerly, so construction is safe without a database.
+func newRoleTestHandler(t *testing.T) http.Handler {
+	t.Helper()
+	pool, err := pgxpool.New(context.Background(), "postgres://127.0.0.1:1/role-test?sslmode=disable&connect_timeout=2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	return New(Config{Store: incident.NewStore(pool), Authenticator: loopbackAuthenticator{}})
 }
 
 func serve(handler http.Handler, request *http.Request) *httptest.ResponseRecorder {
@@ -62,7 +79,7 @@ func serve(handler http.Handler, request *http.Request) *httptest.ResponseRecord
 // denied on EVERY mutating route. Previously IsReadOnly failed open and no
 // per-route role check existed, so such tokens could mutate everything.
 func TestMutationsDeniedForUnknownAbsentAndLegacyRoles(t *testing.T) {
-	handler := newRoleTestHandler()
+	handler := newRoleTestHandler(t)
 	deniedPrincipals := map[string]string{
 		"garbage role":       "garbage-role",
 		"typo role":          "isr-adminn",
@@ -87,7 +104,7 @@ func TestMutationsDeniedForUnknownAbsentAndLegacyRoles(t *testing.T) {
 // test configuration (no stores wired, empty body) handlers answer 400 or
 // 503 — never 401/403.
 func TestMutationsReachableByDesignatedRoles(t *testing.T) {
-	handler := newRoleTestHandler()
+	handler := newRoleTestHandler(t)
 	for _, tc := range mutationCases() {
 		for _, role := range tc.allowedRoles {
 			recorder := serve(handler, loopbackRequest(http.MethodPost, tc.path, "subject-"+role, role, ""))
@@ -102,7 +119,7 @@ func TestMutationsReachableByDesignatedRoles(t *testing.T) {
 // route (least privilege per route), including the outcome dual control
 // split (isr-analyst proposes, isr-adjudicator confirms — never vice versa).
 func TestMutationRolesAreRouteSpecific(t *testing.T) {
-	handler := newRoleTestHandler()
+	handler := newRoleTestHandler(t)
 	allMutationRoles := []string{isr.RoleISRAdmin, isr.RoleISRFeedIngest, isr.RoleISRAnalyst, isr.RoleISRWatchOfficer, isr.RoleISRAdjudicator}
 	for _, tc := range mutationCases() {
 		allowed := map[string]bool{}
@@ -125,7 +142,7 @@ func TestMutationRolesAreRouteSpecific(t *testing.T) {
 // principals are not blocked at the middleware for GET (service-layer
 // role/clearance gates decide); health probes stay public.
 func TestReadBehaviorUnchanged(t *testing.T) {
-	handler := newRoleTestHandler()
+	handler := newRoleTestHandler(t)
 	for _, roles := range []string{isr.RoleDefenceHQObserver, isr.RoleInsurerAggregator, "garbage-role", isr.RoleISRAnalyst} {
 		recorder := serve(handler, loopbackRequest(http.MethodGet, "/v1/isr/detections", "reader", roles, ""))
 		// nil ISRDeps answers 503 after the middleware; the middleware itself

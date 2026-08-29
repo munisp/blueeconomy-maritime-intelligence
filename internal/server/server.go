@@ -61,6 +61,7 @@ func New(config Config) http.Handler {
 	// fails closed at startup if a mutation route lacks a role requirement.
 	requireMutationRoles(api, "POST /v1/incidents", server.create)
 	requireMutationRoles(api, "POST /v1/feed-sources", server.registerFeedSource)
+	requireMutationRoles(api, "POST /v1/feed-sources/{sourceID}/activate", server.activateFeedSource)
 	requireMutationRoles(api, "POST /v1/feed-sources/{sourceID}/revoke", server.revokeFeedSource)
 	requireMutationRoles(api, "POST /v1/feed-sources/{sourceID}/rotate-key", server.rotateFeedSourceKey)
 	requireMutationRoles(api, "POST /v1/feed-events/admit", server.admitFeedEvent)
@@ -133,6 +134,11 @@ func (server *Server) readyz(response http.ResponseWriter, request *http.Request
 }
 
 func (server *Server) registerFeedSource(response http.ResponseWriter, request *http.Request) {
+	principal, ok := principalFrom(request)
+	if !ok {
+		writeError(response, http.StatusUnauthorized, "authentication failed")
+		return
+	}
 	var input struct {
 		SourceID        string `json:"source_id"`
 		SourceKind      string `json:"source_kind"`
@@ -146,16 +152,40 @@ func (server *Server) registerFeedSource(response http.ResponseWriter, request *
 		writeError(response, http.StatusBadRequest, "invalid feed source JSON")
 		return
 	}
+	// Fail-closed: a feed source can never self-activate. Registration always
+	// creates the source PENDING; activation is a separate maker-checker
+	// decision by a distinct isr-admin principal via the activate endpoint.
+	if input.Active {
+		writeError(response, http.StatusBadRequest, "feed sources are never self-activated; a distinct administrator must activate via /v1/feed-sources/{source_id}/activate")
+		return
+	}
 	key, err := base64.RawStdEncoding.DecodeString(input.PublicKeyBase64)
 	if err != nil {
 		writeError(response, http.StatusBadRequest, "public_key_base64 is invalid")
 		return
 	}
-	if err := server.store.RegisterFeedSource(request.Context(), incident.FeedSourceRegistration{SourceID: input.SourceID, SourceKind: input.SourceKind, Authority: input.Authority, PublicKey: key, Active: input.Active}); err != nil {
+	if err := server.store.RegisterFeedSource(request.Context(), incident.FeedSourceRegistration{SourceID: input.SourceID, SourceKind: input.SourceKind, Authority: input.Authority, PublicKey: key, RegisteredBy: principal.Subject}); err != nil {
 		writeIncidentError(response, err)
 		return
 	}
-	writeJSON(response, http.StatusCreated, map[string]string{"source_id": input.SourceID, "status": "registered"})
+	writeJSON(response, http.StatusCreated, map[string]string{"source_id": input.SourceID, "status": "pending_activation"})
+}
+
+// activateFeedSource applies the maker-checker approval: the verified
+// isr-admin principal activating the source must differ from the registrar
+// recorded at registration (enforced again in the store, with the activation
+// persisted as audit evidence).
+func (server *Server) activateFeedSource(response http.ResponseWriter, request *http.Request) {
+	principal, ok := principalFrom(request)
+	if !ok {
+		writeError(response, http.StatusUnauthorized, "authentication failed")
+		return
+	}
+	if err := server.store.ActivateFeedSource(request.Context(), incident.FeedSourceActivation{SourceID: request.PathValue("sourceID"), ActivatedBy: principal.Subject}); err != nil {
+		writeIncidentError(response, err)
+		return
+	}
+	writeJSON(response, http.StatusOK, map[string]string{"source_id": request.PathValue("sourceID"), "status": "active"})
 }
 
 func (server *Server) revokeFeedSource(response http.ResponseWriter, request *http.Request) {
@@ -364,9 +394,10 @@ func writeIncidentError(response http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, incident.ErrNotFound), errors.Is(err, isr.ErrNotFound), errors.Is(err, ledger.ErrNotFound):
 		writeError(response, http.StatusNotFound, err.Error())
-	case errors.Is(err, isr.ErrForbidden):
-		writeError(response, http.StatusForbidden, "insufficient role or clearance")
+	case errors.Is(err, isr.ErrForbidden), errors.Is(err, incident.ErrFeedSourceNotActive), errors.Is(err, incident.ErrFeedSignatureInvalid):
+		writeError(response, http.StatusForbidden, err.Error())
 	case errors.Is(err, incident.ErrIdempotencyConflict), errors.Is(err, incident.ErrCorrelationConflict), errors.Is(err, incident.ErrOptimisticConflict), errors.Is(err, incident.ErrInvalidTransition),
+		errors.Is(err, incident.ErrMakerChecker), errors.Is(err, incident.ErrFeedSourceRevoked),
 		errors.Is(err, isr.ErrConflict), errors.Is(err, ledger.ErrConflict), errors.Is(err, ledger.ErrDualControl), errors.Is(err, ledger.ErrAlreadyConfirmed):
 		writeError(response, http.StatusConflict, err.Error())
 	default:

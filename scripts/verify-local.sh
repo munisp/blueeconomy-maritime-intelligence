@@ -19,22 +19,35 @@ trap cleanup EXIT
 server_binary=$(mktemp)
 GOFLAGS='' go build -o "$server_binary" ./cmd/maritime-intelligence
 DATABASE_URL='postgres://blueeconomy:local-only-integration-password@127.0.0.1:55434/blueeconomy_intelligence?sslmode=disable' \
-MIGRATION_PATH="$repo_root/db/migrations/0001_incidents.sql,$repo_root/db/migrations/0002_casework.sql,$repo_root/db/migrations/0003_outbox_delivery.sql,$repo_root/db/migrations/0004_authorized_feed_sources.sql,$repo_root/db/migrations/0005_feed_source_revocations.sql,$repo_root/db/migrations/0006_feed_source_key_rotation.sql,$repo_root/db/migrations/0007_isr_events.sql,$repo_root/db/migrations/0008_vessel_tracks.sql,$repo_root/db/migrations/0009_outcome_ledger.sql" PORT=18081 AUTH_MODE=loopback_trusted_proxy \
+MIGRATION_PATH="$repo_root/db/migrations/0001_incidents.sql,$repo_root/db/migrations/0002_casework.sql,$repo_root/db/migrations/0003_outbox_delivery.sql,$repo_root/db/migrations/0004_authorized_feed_sources.sql,$repo_root/db/migrations/0005_feed_source_revocations.sql,$repo_root/db/migrations/0006_feed_source_key_rotation.sql,$repo_root/db/migrations/0007_isr_events.sql,$repo_root/db/migrations/0008_vessel_tracks.sql,$repo_root/db/migrations/0009_outcome_ledger.sql,$repo_root/db/migrations/0010_feed_source_activation.sql" PORT=18081 AUTH_MODE=loopback_trusted_proxy \
 "$server_binary" >"$repo_root/.integration-server.log" 2>&1 &
 server_pid=$!
 for _ in $(seq 1 30); do if curl --fail --silent http://127.0.0.1:18081/healthz >/dev/null; then break; fi; sleep 1; done
 curl --fail --silent http://127.0.0.1:18081/healthz >/dev/null
-DATABASE_URL='postgres://blueeconomy:local-only-integration-password@127.0.0.1:55434/blueeconomy_intelligence?sslmode=disable' SKIP_MIGRATION=true go test -tags feedintegration -race ./internal/incident -run 'Test(AuthorizedFeedAdmission|SignedFeedIncidentIsAtomic|FeedSourceRevocation|FeedSourceKeyRotation)AgainstPostgreSQL' -count=1
+DATABASE_URL='postgres://blueeconomy:local-only-integration-password@127.0.0.1:55434/blueeconomy_intelligence?sslmode=disable' SKIP_MIGRATION=true go test -tags feedintegration -race ./internal/incident -run 'Test(AuthorizedFeedAdmission|SignedFeedIncidentIsAtomic|FeedSourceRevocation|FeedSourceKeyRotation|FeedSourceMakerCheckerActivation|FeedSourceRegistrationFailClosed)AgainstPostgreSQL' -count=1
 if curl --silent --show-error -o /tmp/incident-unauthenticated.json -w '%{http_code}' -X GET http://127.0.0.1:18081/v1/incidents/incident-001 | grep -q '^401$'; then :; else echo 'unauthenticated incident request was not rejected' >&2; exit 1; fi
-headers=(-H 'Content-Type: application/json' -H 'X-Trusted-Proxy: loopback' -H 'X-Authenticated-Principal: integration-operator' -H 'X-Authenticated-Roles: nimasa-officer' -H 'X-Authenticated-Clearance: SECRET')
+# Mutations are role-gated (Phase-6 MI-1): feed-source administration needs
+# isr-admin, incident lifecycle needs isr-analyst/isr-watch-officer.
+admin_headers=(-H 'Content-Type: application/json' -H 'X-Trusted-Proxy: loopback' -H 'X-Authenticated-Principal: feed-registrar' -H 'X-Authenticated-Roles: isr-admin' -H 'X-Authenticated-Clearance: SECRET')
+activator_headers=(-H 'Content-Type: application/json' -H 'X-Trusted-Proxy: loopback' -H 'X-Authenticated-Principal: feed-activator' -H 'X-Authenticated-Roles: isr-admin' -H 'X-Authenticated-Clearance: SECRET')
+headers=(-H 'Content-Type: application/json' -H 'X-Trusted-Proxy: loopback' -H 'X-Authenticated-Principal: integration-operator' -H 'X-Authenticated-Roles: isr-analyst' -H 'X-Authenticated-Clearance: SECRET')
 old_key=$(head -c 32 /dev/zero | base64 -w0 | tr -d '=')
 new_key=$(head -c 32 /dev/zero | tr '\000' '\001' | base64 -w0 | tr -d '=')
 grace_until=$(date -u -d '+1 day' '+%Y-%m-%dT%H:%M:%SZ')
-feed_source=$(curl --fail --silent -X POST http://127.0.0.1:18081/v1/feed-sources "${headers[@]}" --data "{\"source_id\":\"feed-http-001\",\"source_kind\":\"VTS\",\"authority\":\"local-authority\",\"public_key_base64\":\"$old_key\",\"active\":true}")
-printf '%s' "$feed_source" | grep -q '"status":"registered"'
-rotation=$(curl --fail --silent -X POST http://127.0.0.1:18081/v1/feed-sources/feed-http-001/rotate-key "${headers[@]}" --data "{\"public_key_base64\":\"$new_key\",\"grace_until\":\"$grace_until\",\"rotated_by\":\"key-operator\"}")
+# Registration never self-activates (Phase-6 MI-2): the source stays PENDING
+# and active:true is rejected; a distinct isr-admin principal must activate.
+if curl --silent --show-error -o /tmp/feed-self-activate.json -w '%{http_code}' -X POST http://127.0.0.1:18081/v1/feed-sources "${admin_headers[@]}" --data "{\"source_id\":\"feed-http-self\",\"source_kind\":\"VTS\",\"authority\":\"local-authority\",\"public_key_base64\":\"$old_key\",\"active\":true}" | grep -q '^400$'; then :; else echo 'self-activating registration was not rejected' >&2; exit 1; fi
+feed_source=$(curl --fail --silent -X POST http://127.0.0.1:18081/v1/feed-sources "${admin_headers[@]}" --data "{\"source_id\":\"feed-http-001\",\"source_kind\":\"VTS\",\"authority\":\"local-authority\",\"public_key_base64\":\"$old_key\"}")
+printf '%s' "$feed_source" | grep -q '"status":"pending_activation"'
+if curl --silent --show-error -o /tmp/feed-self-approval.json -w '%{http_code}' -X POST http://127.0.0.1:18081/v1/feed-sources/feed-http-001/activate "${admin_headers[@]}" | grep -q '^409$'; then :; else echo 'registrar self-activation was not rejected' >&2; exit 1; fi
+activation=$(curl --fail --silent -X POST http://127.0.0.1:18081/v1/feed-sources/feed-http-001/activate "${activator_headers[@]}")
+printf '%s' "$activation" | grep -q '"status":"active"'
+# Legacy read-side roles no longer mutate (Phase-6 MI-1).
+legacy_headers=(-H 'Content-Type: application/json' -H 'X-Trusted-Proxy: loopback' -H 'X-Authenticated-Principal: legacy-operator' -H 'X-Authenticated-Roles: nimasa-officer' -H 'X-Authenticated-Clearance: SECRET')
+if curl --silent --show-error -o /tmp/incident-legacy-role.json -w '%{http_code}' -X POST http://127.0.0.1:18081/v1/incidents "${legacy_headers[@]}" --data '{}' | grep -q '^403$'; then :; else echo 'legacy read-side role was not denied on mutation' >&2; exit 1; fi
+rotation=$(curl --fail --silent -X POST http://127.0.0.1:18081/v1/feed-sources/feed-http-001/rotate-key "${admin_headers[@]}" --data "{\"public_key_base64\":\"$new_key\",\"grace_until\":\"$grace_until\",\"rotated_by\":\"key-operator\"}")
 printf '%s' "$rotation" | grep -q '"status":"key_rotated"'
-if curl --silent --show-error -o /tmp/feed-rotation-invalid.json -w '%{http_code}' -X POST http://127.0.0.1:18081/v1/feed-sources/feed-http-001/rotate-key "${headers[@]}" --data '{"public_key_base64":"not-base64","grace_until":"$grace_until","rotated_by":"key-operator"}' | grep -q '^400$'; then :; else echo 'malformed rotation key was not rejected' >&2; exit 1; fi
+if curl --silent --show-error -o /tmp/feed-rotation-invalid.json -w '%{http_code}' -X POST http://127.0.0.1:18081/v1/feed-sources/feed-http-001/rotate-key "${admin_headers[@]}" --data '{"public_key_base64":"not-base64","grace_until":"$grace_until","rotated_by":"key-operator"}' | grep -q '^400$'; then :; else echo 'malformed rotation key was not rejected' >&2; exit 1; fi
 payload='{"incident_id":"incident-001","source_event_id":"event-001","category":"distress","severity":"HIGH","title":"Distress alert","description":"Verified distress alert from approved source","occurred_at":"2026-08-15T12:00:00Z","created_by":"operator-001"}'
 created=$(curl --fail --silent -X POST http://127.0.0.1:18081/v1/incidents "${headers[@]}" --data "$payload")
 printf '%s' "$created" | grep -q '"status":"OPEN"'

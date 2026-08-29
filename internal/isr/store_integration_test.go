@@ -79,7 +79,10 @@ func TestDetectionAdmissionAgainstPostgreSQL(t *testing.T) {
 		t.Fatal(err)
 	}
 	sourceID := "sar-feed-integration"
-	if err := feedStore.RegisterFeedSource(ctx, incident.FeedSourceRegistration{SourceID: sourceID, SourceKind: "SAR", Authority: "local-authority", PublicKey: publicKey, Active: true}); err != nil {
+	if err := feedStore.RegisterFeedSource(ctx, incident.FeedSourceRegistration{SourceID: sourceID, SourceKind: "SAR", Authority: "local-authority", PublicKey: publicKey, RegisteredBy: "registrar-integration"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := feedStore.ActivateFeedSource(ctx, incident.FeedSourceActivation{SourceID: sourceID, ActivatedBy: "activator-integration"}); err != nil {
 		t.Fatal(err)
 	}
 	detection := Detection{
