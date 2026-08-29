@@ -167,18 +167,18 @@ components:
     FeedSourceRevocation:
       type: object
       additionalProperties: false
-      required: [reason, revoked_by]
+      required: [reason]
       properties:
         reason: {type: string, minLength: 1, maxLength: 512}
-        revoked_by: {type: string, minLength: 1, maxLength: 256}
+        revoked_by: {type: string, minLength: 1, maxLength: 256, description: 'Deprecated and ignored: audit attribution always comes from the verified token subject. Body-supplied actor fields are never used.'}
     FeedSourceKeyRotation:
       type: object
       additionalProperties: false
-      required: [public_key_base64, grace_until, rotated_by]
+      required: [public_key_base64, grace_until]
       properties:
         public_key_base64: {type: string, description: Replacement Ed25519 public key, base64 (raw, unpadded).}
         grace_until: {type: string, format: date-time, description: Prior-key grace deadline (<= 30 days ahead).}
-        rotated_by: {type: string, minLength: 1, maxLength: 256}
+        rotated_by: {type: string, minLength: 1, maxLength: 256, description: 'Deprecated and ignored: audit attribution always comes from the verified token subject. Body-supplied actor fields are never used.'}
     SignedFeedEvent:
       type: object
       additionalProperties: false

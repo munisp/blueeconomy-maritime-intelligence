@@ -25,6 +25,7 @@ server_pid=$!
 for _ in $(seq 1 30); do if curl --fail --silent http://127.0.0.1:18081/healthz >/dev/null; then break; fi; sleep 1; done
 curl --fail --silent http://127.0.0.1:18081/healthz >/dev/null
 DATABASE_URL='postgres://blueeconomy:local-only-integration-password@127.0.0.1:55434/blueeconomy_intelligence?sslmode=disable' SKIP_MIGRATION=true go test -tags feedintegration -race ./internal/incident -run 'Test(AuthorizedFeedAdmission|SignedFeedIncidentIsAtomic|FeedSourceRevocation|FeedSourceKeyRotation|FeedSourceMakerCheckerActivation|FeedSourceRegistrationFailClosed)AgainstPostgreSQL' -count=1
+DATABASE_URL='postgres://blueeconomy:local-only-integration-password@127.0.0.1:55434/blueeconomy_intelligence?sslmode=disable' SKIP_MIGRATION=true go test -tags feedintegration -race ./internal/server -run 'TestFeedSourceLifecycleAndAttributionOverHTTP' -count=1
 if curl --silent --show-error -o /tmp/incident-unauthenticated.json -w '%{http_code}' -X GET http://127.0.0.1:18081/v1/incidents/incident-001 | grep -q '^401$'; then :; else echo 'unauthenticated incident request was not rejected' >&2; exit 1; fi
 # Mutations are role-gated (Phase-6 MI-1): feed-source administration needs
 # isr-admin, incident lifecycle needs isr-analyst/isr-watch-officer.
@@ -45,9 +46,11 @@ printf '%s' "$activation" | grep -q '"status":"active"'
 # Legacy read-side roles no longer mutate (Phase-6 MI-1).
 legacy_headers=(-H 'Content-Type: application/json' -H 'X-Trusted-Proxy: loopback' -H 'X-Authenticated-Principal: legacy-operator' -H 'X-Authenticated-Roles: nimasa-officer' -H 'X-Authenticated-Clearance: SECRET')
 if curl --silent --show-error -o /tmp/incident-legacy-role.json -w '%{http_code}' -X POST http://127.0.0.1:18081/v1/incidents "${legacy_headers[@]}" --data '{}' | grep -q '^403$'; then :; else echo 'legacy read-side role was not denied on mutation' >&2; exit 1; fi
-rotation=$(curl --fail --silent -X POST http://127.0.0.1:18081/v1/feed-sources/feed-http-001/rotate-key "${admin_headers[@]}" --data "{\"public_key_base64\":\"$new_key\",\"grace_until\":\"$grace_until\",\"rotated_by\":\"key-operator\"}")
+# Audit attribution comes from the verified token subject; a forged body
+# rotated_by is ignored (Phase-6 MI-3).
+rotation=$(curl --fail --silent -X POST http://127.0.0.1:18081/v1/feed-sources/feed-http-001/rotate-key "${activator_headers[@]}" --data "{\"public_key_base64\":\"$new_key\",\"grace_until\":\"$grace_until\",\"rotated_by\":\"mallory-body-forgery\"}")
 printf '%s' "$rotation" | grep -q '"status":"key_rotated"'
-if curl --silent --show-error -o /tmp/feed-rotation-invalid.json -w '%{http_code}' -X POST http://127.0.0.1:18081/v1/feed-sources/feed-http-001/rotate-key "${admin_headers[@]}" --data '{"public_key_base64":"not-base64","grace_until":"$grace_until","rotated_by":"key-operator"}' | grep -q '^400$'; then :; else echo 'malformed rotation key was not rejected' >&2; exit 1; fi
+if curl --silent --show-error -o /tmp/feed-rotation-invalid.json -w '%{http_code}' -X POST http://127.0.0.1:18081/v1/feed-sources/feed-http-001/rotate-key "${activator_headers[@]}" --data '{"public_key_base64":"not-base64","grace_until":"$grace_until"}' | grep -q '^400$'; then :; else echo 'malformed rotation key was not rejected' >&2; exit 1; fi
 payload='{"incident_id":"incident-001","source_event_id":"event-001","category":"distress","severity":"HIGH","title":"Distress alert","description":"Verified distress alert from approved source","occurred_at":"2026-08-15T12:00:00Z","created_by":"operator-001"}'
 created=$(curl --fail --silent -X POST http://127.0.0.1:18081/v1/incidents "${headers[@]}" --data "$payload")
 printf '%s' "$created" | grep -q '"status":"OPEN"'
@@ -75,6 +78,10 @@ printf '%s' "$close" | grep -q '"status":"CLOSED"'
 container_id=$("${docker_prefix[@]}" ps --filter name=maritime-intelligence-postgres -q | head -n1)
 rotation_count=$("${docker_prefix[@]}" exec "$container_id" psql -p 55434 -U blueeconomy -d blueeconomy_intelligence -Atc "select count(*) from maritime_feed_source_key_rotations where source_id = 'feed-http-001';")
 test "$rotation_count" = 1
+rotated_by=$("${docker_prefix[@]}" exec "$container_id" psql -p 55434 -U blueeconomy -d blueeconomy_intelligence -Atc "select rotated_by from maritime_feed_source_key_rotations where source_id = 'feed-http-001';")
+test "$rotated_by" = 'feed-activator'
+activated_by=$("${docker_prefix[@]}" exec "$container_id" psql -p 55434 -U blueeconomy -d blueeconomy_intelligence -Atc "select activated_by from maritime_feed_source_activations where source_id = 'feed-http-001';")
+test "$activated_by" = 'feed-activator'
 outbox_count=$("${docker_prefix[@]}" exec "$container_id" psql -p 55434 -U blueeconomy -d blueeconomy_intelligence -Atc 'select count(*) from maritime_incident_outbox where incident_id = '\''incident-001'\'';')
 test "$outbox_count" = 7
 correlation_count=$(${docker_prefix[@]} exec "$container_id" psql -p 55434 -U blueeconomy -d blueeconomy_intelligence -Atc 'select count(*) from maritime_incident_spatial_correlations where incident_id = '\''incident-001'\'';')

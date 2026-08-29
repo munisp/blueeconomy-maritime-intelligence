@@ -189,8 +189,16 @@ func (server *Server) activateFeedSource(response http.ResponseWriter, request *
 }
 
 func (server *Server) revokeFeedSource(response http.ResponseWriter, request *http.Request) {
+	principal, ok := principalFrom(request)
+	if !ok {
+		writeError(response, http.StatusUnauthorized, "authentication failed")
+		return
+	}
 	var input struct {
-		Reason    string `json:"reason"`
+		Reason string `json:"reason"`
+		// RevokedBy is decoded only so legacy clients do not break; it is
+		// NEVER used. Audit attribution always comes from the verified token
+		// subject — body-supplied actor fields are ignored (MI-3).
 		RevokedBy string `json:"revoked_by"`
 	}
 	decoder := json.NewDecoder(request.Body)
@@ -199,7 +207,7 @@ func (server *Server) revokeFeedSource(response http.ResponseWriter, request *ht
 		writeError(response, http.StatusBadRequest, "invalid feed source revocation JSON")
 		return
 	}
-	if err := server.store.RevokeFeedSource(request.Context(), incident.FeedSourceRevocation{SourceID: request.PathValue("sourceID"), Reason: input.Reason, RevokedBy: input.RevokedBy}); err != nil {
+	if err := server.store.RevokeFeedSource(request.Context(), incident.FeedSourceRevocation{SourceID: request.PathValue("sourceID"), Reason: input.Reason, RevokedBy: principal.Subject}); err != nil {
 		writeIncidentError(response, err)
 		return
 	}
@@ -207,10 +215,18 @@ func (server *Server) revokeFeedSource(response http.ResponseWriter, request *ht
 }
 
 func (server *Server) rotateFeedSourceKey(response http.ResponseWriter, request *http.Request) {
+	principal, ok := principalFrom(request)
+	if !ok {
+		writeError(response, http.StatusUnauthorized, "authentication failed")
+		return
+	}
 	var input struct {
 		PublicKeyBase64 string    `json:"public_key_base64"`
 		GraceUntil      time.Time `json:"grace_until"`
-		RotatedBy       string    `json:"rotated_by"`
+		// RotatedBy is decoded only so legacy clients do not break; it is
+		// NEVER used. Audit attribution always comes from the verified token
+		// subject — body-supplied actor fields are ignored (MI-3).
+		RotatedBy string `json:"rotated_by"`
 	}
 	decoder := json.NewDecoder(request.Body)
 	decoder.DisallowUnknownFields()
@@ -223,7 +239,7 @@ func (server *Server) rotateFeedSourceKey(response http.ResponseWriter, request 
 		writeError(response, http.StatusBadRequest, "public_key_base64 is invalid")
 		return
 	}
-	if err := server.store.RotateFeedSourceKey(request.Context(), incident.FeedSourceKeyRotation{SourceID: request.PathValue("sourceID"), NewPublicKey: key, GraceUntil: input.GraceUntil, RotatedBy: input.RotatedBy}); err != nil {
+	if err := server.store.RotateFeedSourceKey(request.Context(), incident.FeedSourceKeyRotation{SourceID: request.PathValue("sourceID"), NewPublicKey: key, GraceUntil: input.GraceUntil, RotatedBy: principal.Subject}); err != nil {
 		writeIncidentError(response, err)
 		return
 	}
