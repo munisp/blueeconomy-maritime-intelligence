@@ -13,7 +13,11 @@ import (
 
 	"github.com/munisp/blueeconomy-maritime-intelligence/internal/incident"
 	"github.com/munisp/blueeconomy-maritime-intelligence/internal/isr"
+	"github.com/munisp/blueeconomy-maritime-intelligence/internal/telemetry"
 	"github.com/segmentio/kafka-go"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type config struct {
@@ -42,6 +46,20 @@ func run() error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	telemetryConfig, err := telemetry.LoadConfig("blueeconomy-maritime-intelligence-outbox-publisher")
+	if err != nil {
+		return err
+	}
+	telemetryPipeline, err := telemetry.Setup(ctx, telemetryConfig)
+	if err != nil {
+		return fmt.Errorf("telemetry setup: %w", err)
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = telemetryPipeline.Shutdown(shutdownCtx)
+	}()
+	tracer := telemetryPipeline.Tracer()
 	store, err := incident.Open(ctx, cfg.databaseURL)
 	if err != nil {
 		return err
@@ -57,12 +75,12 @@ func run() error {
 	if cfg.source == "isr" {
 		// ISR events carry their topic on the outbox row (maritime.isr.v1,
 		// maritime.behaviour.v1, maritime.outcome.v1).
-		isrPublisher := &isrWorker{store: isr.NewStore(store.Pool()), writer: writer, cfg: cfg}
+		isrPublisher := &isrWorker{store: isr.NewStore(store.Pool()), writer: writer, cfg: cfg, tracer: tracer}
 		log.Printf("isr outbox publisher %s delivering Workstream F topics via %s", cfg.workerID, strings.Join(cfg.brokers, ","))
 		return isrPublisher.loop(ctx)
 	}
 	writer.Topic = cfg.topic
-	publisher := &worker{store: store, writer: writer, cfg: cfg}
+	publisher := &worker{store: store, writer: writer, cfg: cfg, tracer: tracer}
 	log.Printf("outbox publisher %s delivering to Kafka topic %s via %s", cfg.workerID, cfg.topic, strings.Join(cfg.brokers, ","))
 	return publisher.loop(ctx)
 }
@@ -71,6 +89,27 @@ type isrWorker struct {
 	store  *isr.Store
 	writer *kafka.Writer
 	cfg    config
+	tracer trace.Tracer
+}
+
+// publishTraced delivers one outbox envelope with a producer span whose
+// context is injected into the Kafka headers, so consumers continue the trace
+// across the async boundary (W3C traceparent + baggage carriers).
+func publishTraced(ctx context.Context, tracer trace.Tracer, writer *kafka.Writer, message kafka.Message) error {
+	spanCtx, span := tracer.Start(ctx, "kafka.publish "+message.Topic,
+		trace.WithSpanKind(trace.SpanKindProducer),
+		trace.WithAttributes(
+			attribute.String("messaging.system", "kafka"),
+			attribute.String("messaging.destination.name", message.Topic),
+		))
+	defer span.End()
+	message.Headers = telemetry.InjectKafkaHeaders(spanCtx, message.Headers)
+	if err := writer.WriteMessages(ctx, message); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "kafka publish failed")
+		return err
+	}
+	return nil
 }
 
 func (w *isrWorker) loop(ctx context.Context) error {
@@ -95,7 +134,7 @@ func (w *isrWorker) deliverOne(ctx context.Context) error {
 	}
 	writeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	err = w.writer.WriteMessages(writeCtx, kafka.Message{
+	err = publishTraced(writeCtx, w.tracer, w.writer, kafka.Message{
 		Topic: event.Topic,
 		Key:   []byte(event.AggregateKey),
 		Value: event.Payload,
@@ -121,6 +160,7 @@ type worker struct {
 	store  *incident.Store
 	writer *kafka.Writer
 	cfg    config
+	tracer trace.Tracer
 }
 
 func (w *worker) loop(ctx context.Context) error {
@@ -145,7 +185,8 @@ func (w *worker) deliverOne(ctx context.Context) error {
 	}
 	writeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	err = w.writer.WriteMessages(writeCtx, kafka.Message{
+	err = publishTraced(writeCtx, w.tracer, w.writer, kafka.Message{
+		Topic: w.cfg.topic,
 		Key:   []byte(event.EventID.String()),
 		Value: event.Payload,
 		Headers: []kafka.Header{

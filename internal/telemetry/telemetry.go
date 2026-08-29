@@ -20,6 +20,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/codes"
 	otlptracegrpc "go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	otelprom "go.opentelemetry.io/otel/exporters/prometheus"
@@ -113,6 +114,7 @@ type Telemetry struct {
 	duration       metric.Float64Histogram
 	fusionLatency  metric.Float64Histogram
 	fusionErrors   metric.Int64Counter
+	dropped        metric.Int64Counter
 }
 
 // Setup builds the meter and tracer pipelines. The Prometheus exporter is
@@ -144,6 +146,10 @@ func Setup(ctx context.Context, config Config) (*Telemetry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create fusion error counter: %w", err)
 	}
+	dropped, err := meter.Int64Counter("telemetry_dropped_total", metric.WithDescription("Spans dropped because the OTLP collector was unreachable; telemetry never fails the business path"))
+	if err != nil {
+		return nil, fmt.Errorf("create dropped-telemetry counter: %w", err)
+	}
 	telemetry := &Telemetry{
 		config:         config,
 		meterProvider:  meterProvider,
@@ -152,7 +158,13 @@ func Setup(ctx context.Context, config Config) (*Telemetry, error) {
 		duration:       duration,
 		fusionLatency:  fusionLatency,
 		fusionErrors:   fusionErrors,
+		dropped:        dropped,
 	}
+	// Propagation is installed even when export is disabled: incoming
+	// traceparent/baggage must still be honoured so distributed context
+	// survives services running with telemetry off (the one sanctioned
+	// fail-open: telemetry absence never changes request handling).
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
 	if !config.Enabled {
 		telemetry.tracer = noop.NewTracerProvider().Tracer(config.ServiceName)
 		return telemetry, nil
@@ -166,13 +178,33 @@ func Setup(ctx context.Context, config Config) (*Telemetry, error) {
 		return nil, fmt.Errorf("create OTLP gRPC trace exporter: %w", err)
 	}
 	telemetry.tracerProvider = sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(exporter),
+		sdktrace.WithBatcher(&countingExporter{next: exporter, dropped: dropped}),
 		sdktrace.WithResource(serviceResource),
 	)
 	otel.SetTracerProvider(telemetry.tracerProvider)
-	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
 	telemetry.tracer = telemetry.tracerProvider.Tracer(config.ServiceName)
 	return telemetry, nil
+}
+
+// countingExporter wraps the OTLP exporter so every failed export increments
+// telemetry_dropped_total. The batch processor already isolates the business
+// path from collector outages (async, bounded queue, drop-on-full); this only
+// makes the drops observable.
+type countingExporter struct {
+	next    sdktrace.SpanExporter
+	dropped metric.Int64Counter
+}
+
+func (exporter *countingExporter) ExportSpans(ctx context.Context, spans []sdktrace.ReadOnlySpan) error {
+	err := exporter.next.ExportSpans(ctx, spans)
+	if err != nil {
+		exporter.dropped.Add(ctx, int64(len(spans)))
+	}
+	return err
+}
+
+func (exporter *countingExporter) Shutdown(ctx context.Context) error {
+	return exporter.next.Shutdown(ctx)
 }
 
 // newMeterPipeline installs a Prometheus reader on a private registry so
@@ -230,16 +262,36 @@ func (recorder *statusRecorder) WriteHeader(status int) {
 	recorder.ResponseWriter.WriteHeader(status)
 }
 
-// Middleware traces and meters every request. The span starts under the HTTP
-// method and is renamed to the matched route pattern (http.Request.Pattern)
-// once the ServeMux has routed, so metric labels never carry raw paths or
-// identifiers. Unmatched routes are labelled "unmatched".
+// tenantBaggageAttributes copies the platform tenant-attribution baggage
+// members (tenant.id, agency — injected at the edge from JWT claims) onto
+// server span attributes. Baggage values are free-form strings, so they stay
+// on traces only; metrics never carry them (low-cardinality rule).
+func tenantBaggageAttributes(ctx context.Context) []attribute.KeyValue {
+	members := baggage.FromContext(ctx)
+	attributes := make([]attribute.KeyValue, 0, 2)
+	if value := members.Member("tenant.id").Value(); value != "" {
+		attributes = append(attributes, attribute.String("tenant.id", value))
+	}
+	if value := members.Member("agency").Value(); value != "" {
+		attributes = append(attributes, attribute.String("agency", value))
+	}
+	return attributes
+}
+
+// Middleware traces and meters every request. The incoming W3C
+// traceparent/baggage headers are extracted so the server span continues the
+// caller's trace. The span starts under the HTTP method and is renamed to the
+// matched route pattern (http.Request.Pattern) once the ServeMux has routed,
+// so metric labels never carry raw paths or identifiers. Unmatched routes are
+// labelled "unmatched".
 func (telemetry *Telemetry) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		started := time.Now()
-		ctx, span := telemetry.tracer.Start(request.Context(), request.Method,
+		extracted := otel.GetTextMapPropagator().Extract(request.Context(), propagation.HeaderCarrier(request.Header))
+		spanAttributes := append([]attribute.KeyValue{attribute.String("http.request.method", request.Method)}, tenantBaggageAttributes(extracted)...)
+		ctx, span := telemetry.tracer.Start(extracted, request.Method,
 			trace.WithSpanKind(trace.SpanKindServer),
-			trace.WithAttributes(attribute.String("http.request.method", request.Method)))
+			trace.WithAttributes(spanAttributes...))
 		recorder := &statusRecorder{ResponseWriter: writer, status: http.StatusOK}
 		// WithContext shallow-copies the request; the ServeMux records the
 		// matched route pattern on that copy, so read it back from there.

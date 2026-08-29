@@ -5,9 +5,11 @@ go 1.25.4
 toolchain go1.25.13
 
 require (
+	github.com/exaring/otelpgx v0.11.1
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.9.2
 	github.com/segmentio/kafka-go v0.4.49
+	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.71.0
 )
 
 require (
@@ -46,6 +48,7 @@ require (
 
 require (
 	github.com/facebookgo/clock v0.0.0-20150410010913-600d898af40a // indirect
+	github.com/felixge/httpsnoop v1.1.0 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/golang/mock v1.6.0 // indirect
 	github.com/grpc-ecosystem/go-grpc-middleware/v2 v2.3.2 // indirect

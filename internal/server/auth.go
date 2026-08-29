@@ -14,6 +14,8 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"net/url"
 	"os"
 	"strings"
@@ -175,7 +177,7 @@ func newOIDCAuthenticator(config AuthConfig) (*oidcAuthenticator, error) {
 		audience:       config.OIDCAudience,
 		jwksURL:        config.OIDCJWKSURL,
 		rolesClientIDs: config.OIDCRolesClientIDs,
-		client:         &http.Client{Transport: transport, Timeout: 10 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return errors.New("JWKS redirects are not permitted") }},
+		client:         &http.Client{Transport: otelhttp.NewTransport(transport), Timeout: 10 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return errors.New("JWKS redirects are not permitted") }},
 		keys:           make(map[string]*rsa.PublicKey),
 	}, nil
 }

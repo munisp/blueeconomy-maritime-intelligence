@@ -17,10 +17,24 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/munisp/blueeconomy-maritime-intelligence/internal/geo"
 	"github.com/munisp/blueeconomy-maritime-intelligence/internal/isr"
 )
+
+// fusionTracer traces intelligence-scoring/fusion operations. It resolves
+// the global tracer provider on every call, so a disabled pipeline (no-op
+// global provider) costs nothing and changes no behavior, and an SDK
+// provider installed at startup is picked up immediately. Track content and
+// vessel identifiers stay out of span attributes (classified-data
+// discipline — only anomaly counts and kinds are recorded).
+func fusionTracer() trace.Tracer {
+	return otel.Tracer("github.com/munisp/blueeconomy-maritime-intelligence/internal/tracks")
+}
 
 // AnomalyKind enumerates the behaviour anomaly rules.
 type AnomalyKind string
@@ -212,14 +226,24 @@ func (engine *Engine) defaultTrackID() string {
 // detection must already carry a verified source signature and a valid
 // classification label; Ingest re-validates fail-closed.
 func (engine *Engine) Ingest(ctx context.Context, detection isr.Detection) (string, []Anomaly, error) {
+	ctx, span := fusionTracer().Start(ctx, "isr.fusion.ingest",
+		trace.WithAttributes(attribute.String("isr.detection.modality", string(detection.Modality))))
+	defer span.End()
 	if err := detection.Validate(); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "detection validation failed")
 		return "", nil, err
 	}
 	if !detection.HasPosition {
-		return "", nil, errors.New("detections without a position cannot enter track fusion")
+		err := errors.New("detections without a position cannot enter track fusion")
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "detection has no position")
+		return "", nil, err
 	}
 	position, err := geo.NewPosition(detection.Latitude, detection.Longitude)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "invalid position")
 		return "", nil, err
 	}
 	engine.mu.Lock()
@@ -227,6 +251,7 @@ func (engine *Engine) Ingest(ctx context.Context, detection isr.Detection) (stri
 	track := engine.associate(detection, position)
 	point := engine.absorbPointLocked(track, detection, position)
 	anomalies := engine.evaluateLocked(ctx, track, point, detection)
+	span.SetAttributes(attribute.Int("isr.fusion.anomalies", len(anomalies)))
 	return track.TrackID, anomalies, nil
 }
 
@@ -511,6 +536,8 @@ func (engine *Engine) evaluateLocked(ctx context.Context, track *Track, point Tr
 // restricted) zone and whose last AIS report is older than the configured
 // gap. Returns newly raised anomalies; each track alerts once.
 func (engine *Engine) ScanDarkVessels(ctx context.Context) []Anomaly {
+	ctx, span := fusionTracer().Start(ctx, "isr.fusion.dark_vessel_scan")
+	defer span.End()
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
 	now := engine.now()
@@ -541,6 +568,7 @@ func (engine *Engine) ScanDarkVessels(ctx context.Context) []Anomaly {
 		}
 		engine.recorder.RecordDetectionLatency(ctx, AnomalyDarkVessel, latency)
 	}
+	span.SetAttributes(attribute.Int("isr.fusion.anomalies", len(anomalies)))
 	return anomalies
 }
 

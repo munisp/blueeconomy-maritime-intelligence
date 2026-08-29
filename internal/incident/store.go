@@ -10,16 +10,35 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/exaring/otelpgx"
 )
 
 type Store struct{ pool *pgxpool.Pool }
 
 func NewStore(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
 
-func Open(ctx context.Context, databaseURL string) (*Store, error) {
-	pool, err := pgxpool.New(ctx, databaseURL)
+// OpenPool connects to PostgreSQL with the otelpgx query tracer attached, so
+// every query emits a child span of the calling request/operation trace. The
+// tracer resolves the global tracer provider: a no-op provider (telemetry
+// disabled) makes this a zero-cost pass-through, so disabled mode keeps its
+// exact pre-instrumentation behavior.
+func OpenPool(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
+	config, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse postgres config: %w", err)
+	}
+	config.ConnConfig.Tracer = otelpgx.NewTracer()
+	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
 		return nil, fmt.Errorf("open postgres: %w", err)
+	}
+	return pool, nil
+}
+
+func Open(ctx context.Context, databaseURL string) (*Store, error) {
+	pool, err := OpenPool(ctx, databaseURL)
+	if err != nil {
+		return nil, err
 	}
 	if err := pool.Ping(ctx); err != nil {
 		pool.Close()

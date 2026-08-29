@@ -31,8 +31,10 @@ import (
 	"go.temporal.io/sdk/worker"
 	sdkworkflow "go.temporal.io/sdk/workflow"
 
+	"github.com/munisp/blueeconomy-maritime-intelligence/internal/incident"
 	"github.com/munisp/blueeconomy-maritime-intelligence/internal/isr"
 	"github.com/munisp/blueeconomy-maritime-intelligence/internal/provenance"
+	"github.com/munisp/blueeconomy-maritime-intelligence/internal/telemetry"
 	isrworkflow "github.com/munisp/blueeconomy-maritime-intelligence/internal/workflow"
 )
 
@@ -138,9 +140,23 @@ func run(logger *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	pool, err := pgxpool.New(ctx, databaseURL)
+	telemetryConfig, err := telemetry.LoadConfig("blueeconomy-maritime-intelligence-isr-worker")
 	if err != nil {
-		return fmt.Errorf("open postgres: %w", err)
+		return err
+	}
+	telemetryPipeline, err := telemetry.Setup(ctx, telemetryConfig)
+	if err != nil {
+		return fmt.Errorf("telemetry setup: %w", err)
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = telemetryPipeline.Shutdown(shutdownCtx)
+	}()
+
+	pool, err := incident.OpenPool(ctx, databaseURL)
+	if err != nil {
+		return err
 	}
 	defer pool.Close()
 	if err := pool.Ping(ctx); err != nil {
