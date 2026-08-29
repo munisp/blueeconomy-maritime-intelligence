@@ -22,11 +22,27 @@ const (
 	RoleFleetOperator     = "fleet-operator"
 	RoleInsurerAggregator = "insurer-aggregator"
 	RoleAuditor           = "auditor"
+	// Mutation roles provisioned by the IdP for the Deep Blue ISR mission
+	// (Phase-6 remediation). Every mutating route is gated on exactly one of
+	// these (see the authoritative table in internal/server/access.go); the
+	// legacy cross-agency roles above retain their read rights only.
+	RoleISRAdmin        = "isr-admin"
+	RoleISRFeedIngest   = "isr-feed-ingest"
+	RoleISRAnalyst      = "isr-analyst"
+	RoleISRWatchOfficer = "isr-watch-officer"
+	RoleISRAdjudicator  = "isr-adjudicator"
 )
 
-// readOnlyRoles may never perform a mutating call.
-var readOnlyRoles = map[string]struct{}{
-	RoleDefenceHQObserver: {}, RoleONSAObserver: {}, RoleInsurerAggregator: {}, RoleAuditor: {},
+// mutatingRoles is the authoritative allow-list: a principal is read-only
+// unless it holds at least one of these recognized roles. (There is no
+// "read-only roles" deny-list — unrecognized roles fail closed by absence.)
+// mutatingRoles may perform at least one mutating call (the per-route role
+// gate still applies on top). Any role absent from this set is read-only:
+// IsReadOnly fails closed on unrecognized roles.
+var mutatingRoles = map[string]struct{}{
+	RoleNIMASAOfficer: {}, RoleNNOfficer: {}, RoleMarinePolice: {}, RoleFleetOperator: {},
+	RoleISRAdmin: {}, RoleISRFeedIngest: {}, RoleISRAnalyst: {},
+	RoleISRWatchOfficer: {}, RoleISRAdjudicator: {},
 }
 
 // trackReaderRoles may read vessel tracks and detections (subject to
@@ -35,6 +51,7 @@ var readOnlyRoles = map[string]struct{}{
 var trackReaderRoles = map[string]struct{}{
 	RoleNIMASAOfficer: {}, RoleDefenceHQObserver: {}, RoleNNOfficer: {},
 	RoleONSAObserver: {}, RoleMarinePolice: {}, RoleFleetOperator: {}, RoleAuditor: {},
+	RoleISRAnalyst: {}, RoleISRWatchOfficer: {},
 }
 
 // outcomeAggregateReaderRoles may read outcome aggregates.
@@ -42,6 +59,7 @@ var outcomeAggregateReaderRoles = map[string]struct{}{
 	RoleNIMASAOfficer: {}, RoleDefenceHQObserver: {}, RoleNNOfficer: {},
 	RoleONSAObserver: {}, RoleMarinePolice: {}, RoleFleetOperator: {},
 	RoleInsurerAggregator: {}, RoleAuditor: {},
+	RoleISRAnalyst: {}, RoleISRWatchOfficer: {}, RoleISRAdjudicator: {},
 }
 
 // Principal is the verified caller: subject, approved roles and clearance.
@@ -57,13 +75,22 @@ func (principal Principal) HasRole(role string) bool {
 	return ok
 }
 
-// IsReadOnly reports whether every role the principal holds is read-only.
-func (principal Principal) IsReadOnly() bool {
-	if len(principal.Roles) == 0 {
-		return true
+// HasAnyRole reports whether the principal holds at least one of the roles.
+func (principal Principal) HasAnyRole(roles ...string) bool {
+	for _, role := range roles {
+		if principal.HasRole(role) {
+			return true
+		}
 	}
+	return false
+}
+
+// IsReadOnly reports whether the principal holds no recognized mutating
+// role. Fail-closed: an absent, garbage or mistyped role is NOT in
+// mutatingRoles, so the principal is read-only and every mutation is denied.
+func (principal Principal) IsReadOnly() bool {
 	for role := range principal.Roles {
-		if _, readOnly := readOnlyRoles[role]; !readOnly {
+		if _, mutating := mutatingRoles[role]; mutating {
 			return false
 		}
 	}

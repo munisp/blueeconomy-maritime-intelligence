@@ -10,6 +10,12 @@ info:
     maritime.isr.v1 / maritime.behaviour.v1 / maritime.outcome.v1.
     Authentication is loopback_trusted_proxy (local edge headers) or
     keycloak_rs256 (Bearer RS256 JWT verified against the realm JWKS).
+    Authorization is fail-closed: every mutating route requires a designated
+    verified-token role (isr-admin for feed-source administration,
+    isr-feed-ingest for signed feed/detection admission, isr-analyst or
+    isr-watch-officer for incident lifecycle, isr-analyst for outcome
+    proposals, isr-adjudicator for outcome confirmations). Unrecognized,
+    absent or read-only roles are denied with 403 on every mutation.
 paths:
   /healthz:
     get:
