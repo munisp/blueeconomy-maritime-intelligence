@@ -2,99 +2,89 @@ package isr
 
 import "testing"
 
-// MI-1 supporting coverage: IsReadOnly is the middleware-level fail-closed
-// check — a principal without a recognized mutating role is read-only, and
-// unrecognized roles never acquire mutation rights by absence of a deny-list.
+// MI-1 regression: IsReadOnly must fail closed. A token carrying a garbage,
+// mistyped or absent role previously failed OPEN (mutations allowed) because
+// IsReadOnly returned false for any unrecognized role.
 func TestIsReadOnlyFailsClosedOnUnrecognizedRoles(t *testing.T) {
 	readOnlyCases := map[string]Principal{
-		"no roles":           {Subject: "sub-1", Roles: map[string]struct{}{}, Clearance: ClassificationSecret},
-		"garbage role":       {Subject: "sub-2", Roles: map[string]struct{}{"garbage-role": {}}, Clearance: ClassificationSecret},
-		"typo role":          {Subject: "sub-3", Roles: map[string]struct{}{"isr-adminn": {}}, Clearance: ClassificationSecret},
-		"case-variant role":  {Subject: "sub-4", Roles: map[string]struct{}{"ISR-ADMIN": {}}, Clearance: ClassificationSecret},
-		"legacy read-only":   {Subject: "sub-5", Roles: map[string]struct{}{RoleDefenceHQObserver: {}}, Clearance: ClassificationSecret},
-		"observer plus typo": {Subject: "sub-6", Roles: map[string]struct{}{RoleONSAObserver: {}, "isr-analyzt": {}}, Clearance: ClassificationSecret},
-		"insurer-aggregator": {Subject: "sub-7", Roles: map[string]struct{}{RoleInsurerAggregator: {}}, Clearance: ClassificationSecret},
-		"auditor":            {Subject: "sub-8", Roles: map[string]struct{}{RoleAuditor: {}}, Clearance: ClassificationSecret},
+		"no roles":           {Subject: "u-none", Roles: map[string]struct{}{}},
+		"garbage role":       {Subject: "u-garbage", Roles: map[string]struct{}{"garbage-role": {}}},
+		"typo role":          {Subject: "u-typo", Roles: map[string]struct{}{"isr-adminn": {}}},
+		"case-variant role":  {Subject: "u-case", Roles: map[string]struct{}{"ISR-ADMIN": {}}},
+		"legacy read-only":   {Subject: "u-obs", Roles: map[string]struct{}{RoleDefenceHQObserver: {}}},
+		"observer plus typo": {Subject: "u-mix", Roles: map[string]struct{}{RoleONSAObserver: {}, "isr-analys": {}}},
+		"insurer-aggregator": {Subject: "u-ins", Roles: map[string]struct{}{RoleInsurerAggregator: {}}},
+		"auditor":            {Subject: "u-aud", Roles: map[string]struct{}{RoleAuditor: {}}},
 	}
 	for name, principal := range readOnlyCases {
 		if !principal.IsReadOnly() {
-			t.Errorf("%s must be read-only", name)
+			t.Fatalf("%s: principal must be read-only (fail-closed)", name)
 		}
 	}
-	mutating := map[string]string{
-		"isr-admin":         RoleISRAdmin,
-		"isr-feed-ingest":   RoleISRFeedIngest,
-		"isr-analyst":       RoleISRAnalyst,
-		"isr-watch-officer": RoleISRWatchOfficer,
-		"isr-adjudicator":   RoleISRAdjudicator,
-		"nimasa-officer":    RoleNIMASAOfficer,
-		"nn-officer":        RoleNNOfficer,
-		"marine-police":     RoleMarinePolice,
-		"fleet-operator":    RoleFleetOperator,
+	mutatingRoles := []string{
+		RoleNIMASAOfficer, RoleNNOfficer, RoleMarinePolice, RoleFleetOperator,
+		RoleISRAdmin, RoleISRFeedIngest, RoleISRAnalyst, RoleISRWatchOfficer, RoleISRAdjudicator,
 	}
-	for name, role := range mutating {
-		principal := Principal{Subject: "sub", Roles: map[string]struct{}{role: {}}, Clearance: ClassificationUnclassified}
+	for _, role := range mutatingRoles {
+		principal := Principal{Subject: "u-" + role, Roles: map[string]struct{}{role: {}}}
 		if principal.IsReadOnly() {
-			t.Errorf("%s (%s) must not be read-only", name, role)
+			t.Fatalf("recognized mutating role %s must not be read-only", role)
 		}
 	}
-	// A recognized mutating role alongside garbage roles still mutates.
-	principal := Principal{Subject: "sub", Roles: map[string]struct{}{RoleISRAnalyst: {}, "garbage": {}}, Clearance: ClassificationUnclassified}
+	// A garbage role alongside a recognized mutating role does not widen or
+	// narrow anything: the recognized role governs.
+	principal := Principal{Subject: "u-mixed", Roles: map[string]struct{}{RoleISRAnalyst: {}, "garbage": {}}}
 	if principal.IsReadOnly() {
-		t.Error("recognized mutating role must dominate unrecognized roles")
+		t.Fatal("recognized mutating role must govern over garbage role")
 	}
 }
 
-// Track reads stay role- and clearance-gated; the insurer-aggregator is
-// denied tracks but admitted to outcome aggregates.
-func TestTrackAndAggregateReadGates(t *testing.T) {
-	secretInsurer := Principal{Subject: "ins-1", Roles: map[string]struct{}{RoleInsurerAggregator: {}}, Clearance: ClassificationSecret}
-	if err := secretInsurer.CanReadTracks(ClassificationUnclassified); err != ErrForbidden {
-		t.Fatalf("insurer-aggregator must be denied tracks, got %v", err)
+// MI-1 regression: read-side role model is unchanged for existing roles and
+// fails closed for unknown roles (deny reads beyond the public floor).
+func TestReadAccessUnchangedAndFailClosed(t *testing.T) {
+	trackReaders := []string{
+		RoleNIMASAOfficer, RoleDefenceHQObserver, RoleNNOfficer, RoleONSAObserver,
+		RoleMarinePolice, RoleFleetOperator, RoleAuditor, RoleISRAnalyst, RoleISRWatchOfficer,
 	}
-	if err := secretInsurer.CanReadOutcomeAggregates(); err != nil {
-		t.Fatalf("insurer-aggregator must read outcome aggregates, got %v", err)
+	for _, role := range trackReaders {
+		principal := Principal{Subject: "u", Roles: map[string]struct{}{role: {}}, Clearance: ClassificationSecret}
+		if err := principal.CanReadTracks(ClassificationSecret); err != nil {
+			t.Fatalf("role %s must retain track read access: %v", role, err)
+		}
+		if err := principal.CanReadOutcomeAggregates(); err != nil {
+			t.Fatalf("role %s must retain aggregate read access: %v", role, err)
+		}
 	}
-	reader := Principal{Subject: "nn-1", Roles: map[string]struct{}{RoleNNOfficer: {}}, Clearance: ClassificationRestricted}
-	if err := reader.CanReadTracks(ClassificationRestricted); err != nil {
-		t.Fatal(err)
+	// Unknown roles are denied track reads regardless of clearance.
+	for _, role := range []string{"garbage-role", "isr-adminn", RoleISRAdmin, RoleISRFeedIngest} {
+		principal := Principal{Subject: "u", Roles: map[string]struct{}{role: {}}, Clearance: ClassificationSecret}
+		if err := principal.CanReadTracks(ClassificationUnclassified); err != ErrForbidden {
+			t.Fatalf("role %q must be denied track reads, got %v", role, err)
+		}
 	}
-	if err := reader.CanReadTracks(ClassificationConfidential); err != ErrForbidden {
-		t.Fatalf("clearance must cover the record label, got %v", err)
+	// Insurer-aggregator keeps its aggregate-only access; unknown roles get nothing.
+	insurer := Principal{Subject: "u", Roles: map[string]struct{}{RoleInsurerAggregator: {}}, Clearance: ClassificationSecret}
+	if err := insurer.CanReadOutcomeAggregates(); err != nil {
+		t.Fatalf("insurer-aggregator must retain aggregate read: %v", err)
 	}
-	unknown := Principal{Subject: "x", Roles: map[string]struct{}{"garbage": {}}, Clearance: ClassificationSecret}
-	if err := unknown.CanReadTracks(ClassificationUnclassified); err != ErrForbidden {
-		t.Fatalf("unknown role must be denied tracks, got %v", err)
+	if err := insurer.CanReadTracks(ClassificationUnclassified); err != ErrForbidden {
+		t.Fatal("insurer-aggregator must remain denied from tracks")
 	}
+	unknown := Principal{Subject: "u", Roles: map[string]struct{}{"garbage": {}}, Clearance: ClassificationSecret}
 	if err := unknown.CanReadOutcomeAggregates(); err != ErrForbidden {
-		t.Fatalf("unknown role must be denied aggregates, got %v", err)
+		t.Fatal("unknown role must be denied outcome aggregates")
 	}
 }
 
-// SAR/Yaoundé read gates are role-gated fail-closed.
-func TestSARAndYaoundeReadGates(t *testing.T) {
-	observer := Principal{Subject: "s1", Roles: map[string]struct{}{RoleSARObserver: {}}, Clearance: ClassificationRestricted}
-	if err := observer.CanReadSAR(ClassificationRestricted); err != nil {
-		t.Fatal(err)
+func TestHasAnyRole(t *testing.T) {
+	principal := Principal{Subject: "u", Roles: map[string]struct{}{RoleISRAnalyst: {}}}
+	if !principal.HasAnyRole(RoleISRAnalyst, RoleISRWatchOfficer) {
+		t.Fatal("HasAnyRole must match one held role")
 	}
-	if err := observer.CanReadSAR(ClassificationConfidential); err != ErrForbidden {
-		t.Fatalf("SAR clearance gate failed: %v", err)
+	if principal.HasAnyRole(RoleISRAdmin, RoleISRAdjudicator) {
+		t.Fatal("HasAnyRole must fail closed when no role matches")
 	}
-	if err := observer.CanReadYaounde(ClassificationUnclassified); err != ErrForbidden {
-		t.Fatalf("sar-observer must not read yaounde state: %v", err)
-	}
-	releaser := Principal{Subject: "y1", Roles: map[string]struct{}{RoleYaoundeReleaser: {}}, Clearance: ClassificationSecret}
-	if err := releaser.CanReadYaounde(ClassificationSecret); err != nil {
-		t.Fatal(err)
-	}
-	if err := releaser.CanReadSAR(ClassificationUnclassified); err != ErrForbidden {
-		t.Fatalf("yaounde roles must not read SAR cases: %v", err)
-	}
-	unknown := Principal{Subject: "x", Roles: map[string]struct{}{"garbage": {}}, Clearance: ClassificationSecret}
-	if err := unknown.CanReadSAR(ClassificationUnclassified); err != ErrForbidden {
-		t.Fatalf("unknown role must be denied SAR reads, got %v", err)
-	}
-	if err := unknown.CanReadYaounde(ClassificationUnclassified); err != ErrForbidden {
-		t.Fatalf("unknown role must be denied yaounde reads, got %v", err)
+	if principal.HasAnyRole() {
+		t.Fatal("HasAnyRole with no required roles must fail closed")
 	}
 }

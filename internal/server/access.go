@@ -33,6 +33,36 @@ var mutationRoleRequirements = map[string][]string{
 	"POST /v1/isr/detections:admit":                {isr.RoleISRFeedIngest},
 	"POST /v1/outcomes":                            {isr.RoleISRAnalyst},
 	"POST /v1/outcomes/{entryID}/confirm":          {isr.RoleISRAdjudicator},
+
+	// Phase 8: Yaounde gateway.
+	"POST /v1/yaounde/peers":                             {isr.RoleYaoundeRegistrar},
+	"POST /v1/yaounde/peers/{peerID}/activate":           {isr.RoleYaoundeApprover},
+	"POST /v1/yaounde/peers/{peerID}/suspend":            {isr.RoleYaoundeRegistrar, isr.RoleYaoundeApprover},
+	"POST /v1/yaounde/peers/{peerID}/revoke":             {isr.RoleYaoundeRegistrar, isr.RoleYaoundeApprover},
+	"POST /v1/yaounde/releases":                          {isr.RoleYaoundeReleaser},
+	"POST /v1/yaounde/releases/{releaseID}/approve":      {isr.RoleYaoundeApprover},
+	"POST /v1/yaounde/releases/{releaseID}/dispatch":     {isr.RoleYaoundeReleaser},
+	"POST /v1/yaounde/releases/{releaseID}/withdraw":     {isr.RoleYaoundeReleaser},
+	"POST /v1/yaounde/releases/{releaseID}/acknowledge":  {isr.RoleYaoundeReleaser, isr.RoleYaoundeApprover},
+	"POST /v1/yaounde/inbound/admit":                     {isr.RoleYaoundeRegistrar},
+	"POST /v1/yaounde/inbound/{reportID}/correlate":      {isr.RoleYaoundeApprover},
+	"POST /v1/yaounde/inbound/{reportID}/reject":         {isr.RoleYaoundeApprover},
+	"POST /v1/yaounde/picture/prepare":                   {isr.RoleYaoundeReleaser},
+	"POST /v1/yaounde/picture/{contributionID}/approve":  {isr.RoleYaoundeApprover},
+	"POST /v1/yaounde/picture/{contributionID}/dispatch": {isr.RoleYaoundeReleaser},
+
+	// Phase 8: SAR C2 console.
+	"POST /v1/sar/cases":                                          {isr.RoleSARWatchkeeper, isr.RoleSARCoordinator},
+	"POST /v1/sar/cases/{caseID}/phase":                           {isr.RoleSARCoordinator},
+	"POST /v1/sar/cases/{caseID}/stage":                           {isr.RoleSARCoordinator},
+	"POST /v1/sar/cases/{caseID}/datum":                           {isr.RoleSARWatchkeeper, isr.RoleSARCoordinator},
+	"POST /v1/sar/resources":                                      {isr.RoleSARResourcer},
+	"POST /v1/sar/resources/{resourceID}/status":                  {isr.RoleSARResourcer},
+	"POST /v1/sar/cases/{caseID}/taskings":                        {isr.RoleSARCoordinator},
+	"POST /v1/sar/cases/{caseID}/taskings/{taskingID}/transition": {isr.RoleSARCoordinator},
+	"POST /v1/sar/cases/{caseID}/sitrep":                          {isr.RoleSARCoordinator},
+	"POST /v1/sar/cases/{caseID}/sos-acknowledge":                 {isr.RoleSARCoordinator},
+	"POST /v1/sar/cases/{caseID}/sos-resolve":                     {isr.RoleSARCoordinator},
 }
 
 // requireMutationRoles registers pattern → handler with the authoritative
