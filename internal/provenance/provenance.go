@@ -80,6 +80,16 @@ func LoadSignerFromEnv(kid string) (*Signer, error) {
 	return NewSigner(kid, key)
 }
 
+// PrivateKey returns a copy of the Ed25519 private key, for signature
+// schemes that sign raw preimages (the feed-admission scheme) rather than
+// JWS envelopes. The key material never leaves the process.
+func (s *Signer) PrivateKey() ed25519.PrivateKey {
+	if s == nil {
+		return nil
+	}
+	return ed25519.PrivateKey(append([]byte(nil), s.key...))
+}
+
 // KeyID returns the signer key id carried in the JWS protected header.
 func (s *Signer) KeyID() string { return s.kid }
 
