@@ -1,0 +1,45 @@
+{
+  "envelopeVersion": "1.0",
+  "eventId": "evt-yaounde-000001",
+  "eventType": "maritime.yaounde.incident_report.v1",
+  "occurredAt": "2026-08-29T14:00:00Z",
+  "producer": "blueeconomy-maritime-intelligence",
+  "correlationId": "corr-yaounde-000001",
+  "fhir": {
+    "resourceType": "Bundle",
+    "type": "message",
+    "bundleId": "bdl-yaounde-000001",
+    "entry": [
+      {
+        "fullUrl": "urn:uuid:1f6ae00e-1da8-5660-a862-f709af02b141",
+        "resource": {
+          "@type": "type.googleapis.com/blueeconomy.contracts.v1.RegionalIncidentReport",
+          "releaseId": "ygr-000001",
+          "incidentReference": "inc-000441",
+          "peerReference": "peer-mmcc-zone-e",
+          "marking": "YAOUNDE_ZONE_E",
+          "classification": "RESTRICTED",
+          "incidentCategoryCode": "PIRACY_ARMED_ROBBERY",
+          "severityLevel": "HIGH",
+          "occurredAt": "2026-08-28T02:40:00Z",
+          "latitudeMicros": 3550000,
+          "longitudeMicros": 5420000,
+          "narrative": "Sample release-cleared narrative: suspicious approach reported by adjudicated incident inc-000441.",
+          "trackDigestSha256": [
+            "sha256:90953515094fab847573782b7d46a84c265ba9b723076d0c63be00936165ccbe",
+            "sha256:ee709dea523cc99d8c7dbbb3bbb7c80de3b8ff9efc9f6bfa31bd5f95b5914242"
+          ],
+          "reportDigestSha256": "sha256:bca51792505dc17d059eedc4411604229911baa102df2c87613f65519abe7a80"
+        }
+      }
+    ]
+  },
+  "provenance": {
+    "principalId": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+    "principalRole": "yaounde-producer",
+    "ledgerCommitHash": "",
+    "signature": "eyJhbGciOiJFZERTQSIsImtpZCI6ImJsdWVlY29ub215LW1hcml0aW1lLWludGVsbGlnZW5jZS0wIn0.eyJjbGFzc2lmaWNhdGlvbiI6IlJFU1RSSUNURUQiLCJjb3JyZWxhdGlvbklkIjoiY29yci15YW91bmRlLTAwMDAwMSIsImVudmVsb3BlVmVyc2lvbiI6IjEuMCIsImV2ZW50SWQiOiJldnQteWFvdW5kZS0wMDAwMDEiLCJldmVudFR5cGUiOiJtYXJpdGltZS55YW91bmRlLmluY2lkZW50X3JlcG9ydC52MSIsImZoaXIiOnsiYnVuZGxlSWQiOiJiZGwteWFvdW5kZS0wMDAwMDEiLCJlbnRyeSI6W3siZnVsbFVybCI6InVybjp1dWlkOjFmNmFlMDBlLTFkYTgtNTY2MC1hODYyLWY3MDlhZjAyYjE0MSIsInJlc291cmNlIjp7IkB0eXBlIjoidHlwZS5nb29nbGVhcGlzLmNvbS9ibHVlZWNvbm9teS5jb250cmFjdHMudjEuUmVnaW9uYWxJbmNpZGVudFJlcG9ydCIsImNsYXNzaWZpY2F0aW9uIjoiUkVTVFJJQ1RFRCIsImluY2lkZW50Q2F0ZWdvcnlDb2RlIjoiUElSQUNZX0FSTUVEX1JPQkJFUlkiLCJpbmNpZGVudFJlZmVyZW5jZSI6ImluYy0wMDA0NDEiLCJsYXRpdHVkZU1pY3JvcyI6MzU1MDAwMCwibG9uZ2l0dWRlTWljcm9zIjo1NDIwMDAwLCJtYXJraW5nIjoiWUFPVU5ERV9aT05FX0UiLCJuYXJyYXRpdmUiOiJTYW1wbGUgcmVsZWFzZS1jbGVhcmVkIG5hcnJhdGl2ZTogc3VzcGljaW91cyBhcHByb2FjaCByZXBvcnRlZCBieSBhZGp1ZGljYXRlZCBpbmNpZGVudCBpbmMtMDAwNDQxLiIsIm9jY3VycmVkQXQiOiIyMDI2LTA4LTI4VDAyOjQwOjAwWiIsInBlZXJSZWZlcmVuY2UiOiJwZWVyLW1tY2Mtem9uZS1lIiwicmVsZWFzZUlkIjoieWdyLTAwMDAwMSIsInJlcG9ydERpZ2VzdFNoYTI1NiI6InNoYTI1NjpiY2E1MTc5MjUwNWRjMTdkMDU5ZWVkYzQ0MTE2MDQyMjk5MTFiYWExMDJkZjJjODc2MTNmNjU1MTlhYmU3YTgwIiwic2V2ZXJpdHlMZXZlbCI6IkhJR0giLCJ0cmFja0RpZ2VzdFNoYTI1NiI6WyJzaGEyNTY6OTA5NTM1MTUwOTRmYWI4NDc1NzM3ODJiN2Q0NmE4NGMyNjViYTliNzIzMDc2ZDBjNjNiZTAwOTM2MTY1Y2NiZSIsInNoYTI1NjplZTcwOWRlYTUyM2NjOTlkOGM3ZGJiYjNiYmI3YzgwZGUzYjhmZjllZmM5ZjZiZmEzMWJkNWY5NWI1OTE0MjQyIl19fV0sInJlc291cmNlVHlwZSI6IkJ1bmRsZSIsInR5cGUiOiJtZXNzYWdlIn0sIm9jY3VycmVkQXQiOiIyMDI2LTA4LTI5VDE0OjAwOjAwWiIsInByb2R1Y2VyIjoiYmx1ZWVjb25vbXktbWFyaXRpbWUtaW50ZWxsaWdlbmNlIiwicHJvdmVuYW5jZSI6eyJsZWRnZXJDb21taXRIYXNoIjoiIiwicHJpbmNpcGFsSWQiOiJmNDdhYzEwYi01OGNjLTQzNzItYTU2Ny0wZTAyYjJjM2Q0NzkiLCJwcmluY2lwYWxSb2xlIjoieWFvdW5kZS1wcm9kdWNlciJ9LCJyZWNvcmRDbGFzc2lmaWNhdGlvbiI6IlJFU1RSSUNURUQifQ._9VZwRVovDd0C5C2NqgbOoo8xSqJ4F0NiqTPscq-Ptx85GMCYwT7kaffX_O5TmW9g-RdOyz0Bt980ZJ46jv-Bg"
+  },
+  "classification": "RESTRICTED",
+  "recordClassification": "RESTRICTED"
+}
