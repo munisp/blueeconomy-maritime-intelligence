@@ -33,6 +33,17 @@ const (
 	RoleISRAdjudicator  = "isr-adjudicator"
 )
 
+// Phase-8 roles: Yaoundé gateway and SAR C2 console.
+const (
+	RoleYaoundeRegistrar = "yaounde-registrar" // peer registration
+	RoleYaoundeReleaser  = "yaounde-releaser"  // release/picture draft+dispatch
+	RoleYaoundeApprover  = "yaounde-approver"  // maker-checker approval (distinct from releaser)
+	RoleSARWatchkeeper   = "sar-watchkeeper"   // open cases, VOO lookup, datum
+	RoleSARCoordinator   = "sar-coordinator"   // phase/stage transitions, SITREPs
+	RoleSARResourcer     = "sar-resourcer"     // SRU registry + tasking
+	RoleSARObserver      = "sar-observer"      // read-only console
+)
+
 // mutatingRoles is the authoritative allow-list: a principal is read-only
 // unless it holds at least one of these recognized roles. (There is no
 // "read-only roles" deny-list — unrecognized roles fail closed by absence.)
@@ -43,6 +54,50 @@ var mutatingRoles = map[string]struct{}{
 	RoleNIMASAOfficer: {}, RoleNNOfficer: {}, RoleMarinePolice: {}, RoleFleetOperator: {},
 	RoleISRAdmin: {}, RoleISRFeedIngest: {}, RoleISRAnalyst: {},
 	RoleISRWatchOfficer: {}, RoleISRAdjudicator: {},
+	RoleYaoundeRegistrar: {}, RoleYaoundeReleaser: {}, RoleYaoundeApprover: {},
+	RoleSARWatchkeeper: {}, RoleSARCoordinator: {}, RoleSARResourcer: {},
+}
+
+// sarReaderRoles may read SAR cases/timelines/SITREPs (clearance-gated per
+// record). yaoundeReaderRoles may read the exchange state (peers, releases,
+// inbound, picture, audit).
+var sarReaderRoles = map[string]struct{}{
+	RoleSARWatchkeeper: {}, RoleSARCoordinator: {}, RoleSARResourcer: {},
+	RoleSARObserver: {}, RoleAuditor: {},
+}
+var yaoundeReaderRoles = map[string]struct{}{
+	RoleYaoundeRegistrar: {}, RoleYaoundeReleaser: {}, RoleYaoundeApprover: {},
+	RoleISRAdmin: {}, RoleAuditor: {},
+}
+
+// CanReadSAR enforces role + clearance for SAR case reads (fail-closed).
+func (principal Principal) CanReadSAR(recordClassification Classification) error {
+	allowed := false
+	for role := range principal.Roles {
+		if _, ok := sarReaderRoles[role]; ok {
+			allowed = true
+			break
+		}
+	}
+	if !allowed || !principal.Clearance.Covers(recordClassification) {
+		return ErrForbidden
+	}
+	return nil
+}
+
+// CanReadYaounde enforces role + clearance for gateway exchange reads.
+func (principal Principal) CanReadYaounde(recordClassification Classification) error {
+	allowed := false
+	for role := range principal.Roles {
+		if _, ok := yaoundeReaderRoles[role]; ok {
+			allowed = true
+			break
+		}
+	}
+	if !allowed || !principal.Clearance.Covers(recordClassification) {
+		return ErrForbidden
+	}
+	return nil
 }
 
 // trackReaderRoles may read vessel tracks and detections (subject to
