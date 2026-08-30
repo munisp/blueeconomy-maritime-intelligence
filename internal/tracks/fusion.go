@@ -588,6 +588,16 @@ func (engine *Engine) Track(trackID string) (Track, bool) {
 // Tracks lists fused track snapshots (defensive copies). Classified-data
 // discipline: callers must enforce clearance before returning any track to a
 // principal.
+// Zones returns the configured geofence zones (defensive copy) for
+// zone-scoped consumers such as the Yaounde shared-picture pipeline.
+func (engine *Engine) Zones() []geo.Zone {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	zones := make([]geo.Zone, len(engine.zones))
+	copy(zones, engine.zones)
+	return zones
+}
+
 func (engine *Engine) Tracks() []Track {
 	engine.mu.Lock()
 	defer engine.mu.Unlock()

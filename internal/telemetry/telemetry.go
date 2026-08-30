@@ -115,6 +115,14 @@ type Telemetry struct {
 	fusionLatency  metric.Float64Histogram
 	fusionErrors   metric.Int64Counter
 	dropped        metric.Int64Counter
+
+	yaoundeReleases   metric.Int64Counter
+	yaoundeDispatches metric.Int64Counter
+	yaoundeRefusals   metric.Int64Counter
+	yaoundeInbound    metric.Int64Counter
+	sarCases          metric.Int64Counter
+	sarSitreps        metric.Int64Counter
+	sarIntakeRejected metric.Int64Counter
 }
 
 // Setup builds the meter and tracer pipelines. The Prometheus exporter is
@@ -150,15 +158,50 @@ func Setup(ctx context.Context, config Config) (*Telemetry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create dropped-telemetry counter: %w", err)
 	}
+	yaoundeReleases, err := meter.Int64Counter("yaounde.releases.total", metric.WithDescription("Yaounde release transitions, partitioned by state"))
+	if err != nil {
+		return nil, fmt.Errorf("create yaounde release counter: %w", err)
+	}
+	yaoundeDispatches, err := meter.Int64Counter("yaounde.dispatches.total", metric.WithDescription("Yaounde dispatch outcomes"))
+	if err != nil {
+		return nil, fmt.Errorf("create yaounde dispatch counter: %w", err)
+	}
+	yaoundeRefusals, err := meter.Int64Counter("yaounde.refusals.total", metric.WithDescription("Audited policy refusals, partitioned by reason class"))
+	if err != nil {
+		return nil, fmt.Errorf("create yaounde refusal counter: %w", err)
+	}
+	yaoundeInbound, err := meter.Int64Counter("yaounde.inbound.total", metric.WithDescription("Inbound peer report admission outcomes"))
+	if err != nil {
+		return nil, fmt.Errorf("create yaounde inbound counter: %w", err)
+	}
+	sarCases, err := meter.Int64Counter("sar.cases.total", metric.WithDescription("SAR case opens, partitioned by intake kind"))
+	if err != nil {
+		return nil, fmt.Errorf("create sar case counter: %w", err)
+	}
+	sarSitreps, err := meter.Int64Counter("sar.sitreps.total", metric.WithDescription("SAR SITREPs issued"))
+	if err != nil {
+		return nil, fmt.Errorf("create sar sitrep counter: %w", err)
+	}
+	sarIntakeRejected, err := meter.Int64Counter("sar.intake.rejected.total", metric.WithDescription("SAR intake records rejected and dead-lettered, partitioned by reason"))
+	if err != nil {
+		return nil, fmt.Errorf("create sar intake rejection counter: %w", err)
+	}
 	telemetry := &Telemetry{
-		config:         config,
-		meterProvider:  meterProvider,
-		metricsHandler: metricsHandler,
-		requests:       requests,
-		duration:       duration,
-		fusionLatency:  fusionLatency,
-		fusionErrors:   fusionErrors,
-		dropped:        dropped,
+		config:            config,
+		meterProvider:     meterProvider,
+		metricsHandler:    metricsHandler,
+		requests:          requests,
+		duration:          duration,
+		fusionLatency:     fusionLatency,
+		fusionErrors:      fusionErrors,
+		dropped:           dropped,
+		yaoundeReleases:   yaoundeReleases,
+		yaoundeDispatches: yaoundeDispatches,
+		yaoundeRefusals:   yaoundeRefusals,
+		yaoundeInbound:    yaoundeInbound,
+		sarCases:          sarCases,
+		sarSitreps:        sarSitreps,
+		sarIntakeRejected: sarIntakeRejected,
 	}
 	// Propagation is installed even when export is disabled: incoming
 	// traceparent/baggage must still be honoured so distributed context
@@ -336,4 +379,64 @@ func (telemetry *Telemetry) RecordDetectionLatency(ctx context.Context, kind str
 		seconds = 0
 	}
 	telemetry.fusionLatency.Record(ctx, seconds, metric.WithAttributes(attribute.String("isr.anomaly.kind", kind)))
+}
+
+// Phase-8 recorders: no-ops when telemetry is disabled (nil-safe counters are
+// OTel no-op instruments), telemetry never fails the business path.
+
+// RecordYaoundeRelease counts one release transition.
+func (t *Telemetry) RecordYaoundeRelease(ctx context.Context, state, peerKind string) {
+	if t == nil {
+		return
+	}
+	t.yaoundeReleases.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("state", state), attribute.String("peer_kind", peerKind)))
+}
+
+// RecordYaoundeDispatch counts one dispatch/delivery attempt outcome.
+func (t *Telemetry) RecordYaoundeDispatch(ctx context.Context, outcome string) {
+	if t == nil {
+		return
+	}
+	t.yaoundeDispatches.Add(ctx, 1, metric.WithAttributes(attribute.String("outcome", outcome)))
+}
+
+// RecordYaoundeRefusal counts one audited policy refusal.
+func (t *Telemetry) RecordYaoundeRefusal(ctx context.Context, reason string) {
+	if t == nil {
+		return
+	}
+	t.yaoundeRefusals.Add(ctx, 1, metric.WithAttributes(attribute.String("reason", reason)))
+}
+
+// RecordYaoundeInbound counts one inbound admission outcome.
+func (t *Telemetry) RecordYaoundeInbound(ctx context.Context, outcome string) {
+	if t == nil {
+		return
+	}
+	t.yaoundeInbound.Add(ctx, 1, metric.WithAttributes(attribute.String("outcome", outcome)))
+}
+
+// RecordSARCase counts one case open.
+func (t *Telemetry) RecordSARCase(ctx context.Context, intakeKind string) {
+	if t == nil {
+		return
+	}
+	t.sarCases.Add(ctx, 1, metric.WithAttributes(attribute.String("intake_kind", intakeKind)))
+}
+
+// RecordSARSitrep counts one issued SITREP.
+func (t *Telemetry) RecordSARSitrep(ctx context.Context) {
+	if t == nil {
+		return
+	}
+	t.sarSitreps.Add(ctx, 1)
+}
+
+// RecordSARIntakeRejected counts one dead-lettered intake record.
+func (t *Telemetry) RecordSARIntakeRejected(ctx context.Context, reason string) {
+	if t == nil {
+		return
+	}
+	t.sarIntakeRejected.Add(ctx, 1, metric.WithAttributes(attribute.String("reason", reason)))
 }

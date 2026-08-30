@@ -10,15 +10,21 @@ import (
 	"strings"
 	"time"
 
+	"github.com/munisp/blueeconomy-maritime-intelligence/internal/geo"
 	"github.com/munisp/blueeconomy-maritime-intelligence/internal/incident"
 	"github.com/munisp/blueeconomy-maritime-intelligence/internal/isr"
 	"github.com/munisp/blueeconomy-maritime-intelligence/internal/ledger"
+	"github.com/munisp/blueeconomy-maritime-intelligence/internal/sar"
+	"github.com/munisp/blueeconomy-maritime-intelligence/internal/telemetry"
 	"github.com/munisp/blueeconomy-maritime-intelligence/internal/tracks"
+	"github.com/munisp/blueeconomy-maritime-intelligence/internal/yaounde"
 )
 
 type Server struct {
 	store         *incident.Store
 	isr           *ISRDeps
+	telemetry     *telemetry.Telemetry
+	geoSOS        *geoSOSClient
 	authenticator Authenticator
 	readyzCheck   func(ctx context.Context) error
 	metrics       http.Handler
@@ -32,6 +38,17 @@ type ISRDeps struct {
 	TrackStore *tracks.Store
 	Fusion     *tracks.Engine
 	Outcomes   *ledger.OutcomeStore
+	// Phase 8: Yaounde gateway + SAR C2 console. Nil disables the routes
+	// fail-closed (503). Zones are the configured ISR geofence zones used
+	// for picture scoping; SARTracks feeds VOO lookups.
+	Yaounde   *yaounde.Store
+	SAR       *sar.Store
+	Zones     []geo.Zone
+	SARTracks sar.TrackSource
+	// GeoSOSBaseURL/GeoSOSToken configure the geo-service SOS lifecycle
+	// client; unset => UNCONFIGURED (503), never simulated.
+	GeoSOSBaseURL string
+	GeoSOSToken   string
 	// FusionErrorHook counts fusion ingest failures observed after durable
 	// detection admission (metric hook); nil disables the counter, never the
 	// structured log.
@@ -43,6 +60,7 @@ type ISRDeps struct {
 type Config struct {
 	Store         *incident.Store
 	ISR           *ISRDeps
+	Telemetry     *telemetry.Telemetry
 	Authenticator Authenticator
 	ReadyzCheck   func(ctx context.Context) error
 	Metrics       http.Handler
@@ -54,7 +72,10 @@ func New(config Config) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	server := &Server{store: config.Store, isr: config.ISR, authenticator: config.Authenticator, readyzCheck: config.ReadyzCheck, metrics: config.Metrics, logger: logger}
+	server := &Server{store: config.Store, isr: config.ISR, authenticator: config.Authenticator, readyzCheck: config.ReadyzCheck, metrics: config.Metrics, logger: logger, telemetry: config.Telemetry}
+	if config.ISR != nil {
+		server.geoSOS = &geoSOSClient{baseURL: config.ISR.GeoSOSBaseURL, token: config.ISR.GeoSOSToken, client: &http.Client{Timeout: 15 * time.Second}}
+	}
 	api := http.NewServeMux()
 	// Every mutating route is registered through requireMutationRoles, which
 	// applies the authoritative role table (internal/server/access.go) and
@@ -78,6 +99,53 @@ func New(config Config) http.Handler {
 	api.HandleFunc("GET /v1/outcomes/aggregates", server.outcomeAggregates)
 	requireMutationRoles(api, "POST /v1/outcomes", server.proposeOutcome)
 	requireMutationRoles(api, "POST /v1/outcomes/{entryID}/confirm", server.confirmOutcome)
+
+	// Phase 8: Yaounde gateway (human-gated exchange).
+	if server.isr != nil && server.isr.Yaounde != nil {
+		api.HandleFunc("GET /v1/yaounde/status", server.yaoundeStatus)
+		api.HandleFunc("GET /v1/yaounde/peers", server.yaoundeListPeers)
+		requireMutationRoles(api, "POST /v1/yaounde/peers", server.yaoundeRegisterPeer)
+		requireMutationRoles(api, "POST /v1/yaounde/peers/{peerID}/activate", func(w http.ResponseWriter, r *http.Request) { server.yaoundePeerLifecycle(w, r, "activate") })
+		requireMutationRoles(api, "POST /v1/yaounde/peers/{peerID}/suspend", func(w http.ResponseWriter, r *http.Request) { server.yaoundePeerLifecycle(w, r, "suspend") })
+		requireMutationRoles(api, "POST /v1/yaounde/peers/{peerID}/revoke", func(w http.ResponseWriter, r *http.Request) { server.yaoundePeerLifecycle(w, r, "revoke") })
+		api.HandleFunc("GET /v1/yaounde/releases", server.yaoundeListReleases)
+		api.HandleFunc("GET /v1/yaounde/releases/{releaseID}", server.yaoundeGetRelease)
+		requireMutationRoles(api, "POST /v1/yaounde/releases", server.yaoundeDraftRelease)
+		requireMutationRoles(api, "POST /v1/yaounde/releases/{releaseID}/approve", server.yaoundeApproveRelease)
+		requireMutationRoles(api, "POST /v1/yaounde/releases/{releaseID}/dispatch", server.yaoundeDispatchRelease)
+		requireMutationRoles(api, "POST /v1/yaounde/releases/{releaseID}/withdraw", server.yaoundeWithdrawRelease)
+		requireMutationRoles(api, "POST /v1/yaounde/releases/{releaseID}/acknowledge", server.yaoundeAcknowledgeRelease)
+		requireMutationRoles(api, "POST /v1/yaounde/inbound/admit", server.yaoundeAdmitInbound)
+		requireMutationRoles(api, "POST /v1/yaounde/inbound/{reportID}/correlate", func(w http.ResponseWriter, r *http.Request) { server.yaoundeCorrelateInbound(w, r, false) })
+		requireMutationRoles(api, "POST /v1/yaounde/inbound/{reportID}/reject", func(w http.ResponseWriter, r *http.Request) { server.yaoundeCorrelateInbound(w, r, true) })
+		requireMutationRoles(api, "POST /v1/yaounde/picture/prepare", server.yaoundePreparePicture)
+		requireMutationRoles(api, "POST /v1/yaounde/picture/{contributionID}/approve", server.yaoundeApprovePicture)
+		requireMutationRoles(api, "POST /v1/yaounde/picture/{contributionID}/dispatch", server.yaoundeDispatchPicture)
+		api.HandleFunc("GET /v1/yaounde/picture", server.yaoundeListPicture)
+		api.HandleFunc("GET /v1/yaounde/audit", server.yaoundeAudit)
+	}
+
+	// Phase 8: SAR C2 case engine.
+	if server.isr != nil && server.isr.SAR != nil {
+		api.HandleFunc("GET /v1/sar/cases", server.sarListCases)
+		requireMutationRoles(api, "POST /v1/sar/cases", server.sarOpenCase)
+		api.HandleFunc("GET /v1/sar/cases/{caseID}", server.sarGetCaseHandler)
+		api.HandleFunc("GET /v1/sar/cases/{caseID}/timeline", server.sarTimeline)
+		requireMutationRoles(api, "POST /v1/sar/cases/{caseID}/phase", server.sarTransitionPhase)
+		requireMutationRoles(api, "POST /v1/sar/cases/{caseID}/stage", server.sarTransitionStage)
+		requireMutationRoles(api, "POST /v1/sar/cases/{caseID}/datum", server.sarSetDatum)
+		api.HandleFunc("GET /v1/sar/resources", server.sarListResources)
+		requireMutationRoles(api, "POST /v1/sar/resources", server.sarRegisterResource)
+		requireMutationRoles(api, "POST /v1/sar/resources/{resourceID}/status", server.sarSetResourceStatus)
+		api.HandleFunc("GET /v1/sar/cases/{caseID}/taskings", server.sarListTaskings)
+		requireMutationRoles(api, "POST /v1/sar/cases/{caseID}/taskings", server.sarProposeTasking)
+		requireMutationRoles(api, "POST /v1/sar/cases/{caseID}/taskings/{taskingID}/transition", server.sarTransitionTasking)
+		requireMutationRoles(api, "POST /v1/sar/cases/{caseID}/sitrep", server.sarIssueSitrep)
+		api.HandleFunc("GET /v1/sar/cases/{caseID}/sitrep", server.sarListSitreps)
+		api.HandleFunc("GET /v1/sar/cases/{caseID}/voo", server.sarListVOO)
+		requireMutationRoles(api, "POST /v1/sar/cases/{caseID}/sos-acknowledge", func(w http.ResponseWriter, r *http.Request) { server.sarMirrorSOS(w, r, false) })
+		requireMutationRoles(api, "POST /v1/sar/cases/{caseID}/sos-resolve", func(w http.ResponseWriter, r *http.Request) { server.sarMirrorSOS(w, r, true) })
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", server.health)
 	mux.HandleFunc("GET /readyz", server.readyz)
