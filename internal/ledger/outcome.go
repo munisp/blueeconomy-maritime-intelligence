@@ -1,39 +1,32 @@
-// Package ledger binds Deep Blue Project outcome evidence (verified incident
-// reductions and the resulting premium deltas) to TigerBeetle transfers.
-// Posting is dual-control: a proposal becomes a confirmed immutable ledger
-// entry only when a second, distinct principal confirms it, and the database
-// enforces proposer != confirmer plus insert-only immutability so premium
-// outcomes stay beyond single-operator influence. Configuration is
-// fail-closed: no outcome can be confirmed without a TigerBeetle client.
 package ledger
 
 import (
-	"crypto/sha256"
 	"errors"
 	"fmt"
-	"strings"
 
 	tigerbeetle "github.com/tigerbeetle/tigerbeetle-go"
+	"github.com/tigerbeetle/tigerbeetle-go/pkg/types"
 )
 
-// tigerBeetleClient is the minimal TigerBeetle surface used by the outcome
-// ledger, so tests substitute a fake.
-type tigerBeetleClient interface {
-	CreateAccounts([]tigerbeetle.Account) ([]tigerbeetle.CreateAccountResult, error)
-	CreateTransfers([]tigerbeetle.Transfer) ([]tigerbeetle.CreateTransferResult, error)
-}
+// Outcome-ledger TigerBeetle binding. Two platform accounts — incident
+// reductions credit the INSURANCE_OUTCOME account from PLATFORM_RESERVE;
+// premium deltas move between them — so every confirmed entry is a
+// deterministic double-entry transfer whose id derives from the entry id
+// (crash-safe retries post the same transfer id).
 
-// EntryKind enumerates the outcome-ledger evidence kinds.
+const (
+	ledgerCodeOutcome uint32 = 1
+)
+
+// EntryKind enumerates the outcome evidence categories.
 type EntryKind string
 
 const (
-	// EntryKindIncidentVerified records one verified incident reduction.
 	EntryKindIncidentVerified EntryKind = "incident-verified"
-	// EntryKindPremiumDelta records premium-delta evidence in basis points.
-	EntryKindPremiumDelta EntryKind = "premium-delta"
+	EntryKindPremiumDelta     EntryKind = "premium-delta"
 )
 
-// Metric/unit binding per entry kind (also DB-enforced by CHECK).
+// Metric and unit constants mirrored by the DB CHECK constraints.
 const (
 	MetricIncidentReduction = "incident-reduction-count"
 	MetricPremiumDelta      = "premium-delta-basis-points"
@@ -41,108 +34,103 @@ const (
 	UnitBasisPoints         = "basis-points"
 )
 
-// Platform accounts: incident-reduction evidence flows into premium-delta
-// evidence, making the binding explicit in the ledger.
-var (
-	// IncidentReductionAccountID is account 1 on the outcome ledger.
-	IncidentReductionAccountID = tigerbeetle.ToUint128(1)
-	// PremiumDeltaAccountID is account 2 on the outcome ledger.
-	PremiumDeltaAccountID = tigerbeetle.ToUint128(2)
+// Account identifiers (deterministic, documented in docs).
+const (
+	accountPlatformReserve uint64 = 1
+	accountOutcome         uint64 = 2
 )
 
-// Service posts outcome transfers to TigerBeetle.
+// Service posts outcome transfers against a TigerBeetle cluster.
 type Service struct {
-	client tigerBeetleClient
-	ledger uint32
-	code   uint16
+	client    tigerbeetle.Client
+	ledgerID  uint32
+	accountA  types.Uint128
+	accountB  types.Uint128
 }
 
-// New fails closed without a client, ledger or code.
-func New(client tigerBeetleClient, ledgerID uint32, code uint16) (*Service, error) {
+// New fails closed without a connected client.
+func New(client tigerbeetle.Client, ledgerID uint32, _ uint64) (*Service, error) {
 	if client == nil {
-		return nil, errors.New("TigerBeetle client is required (fail-closed)")
+		return nil, errors.New("tigerbeetle client is required (fail-closed)")
 	}
 	if ledgerID == 0 {
-		return nil, errors.New("TigerBeetle ledger id must be non-zero")
+		return nil, errors.New("tigerbeetle ledger id must be positive")
 	}
-	if code == 0 {
-		return nil, errors.New("TigerBeetle code must be non-zero")
-	}
-	return &Service{client: client, ledger: ledgerID, code: code}, nil
+	return &Service{
+		client:   client,
+		ledgerID: ledgerID,
+		accountA: types.ToUint128(accountPlatformReserve),
+		accountB: types.ToUint128(accountOutcome),
+	}, nil
 }
 
-// EnsureAccounts creates the two platform outcome accounts idempotently.
+// EnsureAccounts provisions the two outcome accounts idempotently.
 func (service *Service) EnsureAccounts() error {
-	accounts := []tigerbeetle.Account{
-		{ID: IncidentReductionAccountID, Ledger: service.ledger, Code: service.code},
-		{ID: PremiumDeltaAccountID, Ledger: service.ledger, Code: service.code},
+	accounts := []types.Account{
+		{ID: service.accountA, Ledger: service.ledgerID, Code: ledgerCodeOutcome},
+		{ID: service.accountB, Ledger: service.ledgerID, Code: ledgerCodeOutcome},
 	}
 	results, err := service.client.CreateAccounts(accounts)
 	if err != nil {
 		return fmt.Errorf("create outcome accounts: %w", err)
 	}
-	// TigerBeetle returns only failed operations; an empty result means every
-	// account was created.
 	for _, result := range results {
-		if result.Status != tigerbeetle.AccountCreated && result.Status != tigerbeetle.AccountExists {
-			return fmt.Errorf("create outcome account returned %v", result.Status)
+		if result.Result != types.AccountExists {
+			return fmt.Errorf("create outcome account %d: %s", result.Index, result.Result.String())
 		}
 	}
 	return nil
 }
 
-// EntryTransferID deterministically derives the TigerBeetle transfer id from
-// the outcome entry id so confirmation replays converge on one transfer.
-func EntryTransferID(entryID string) (tigerbeetle.Uint128, error) {
-	if strings.TrimSpace(entryID) == "" || len(entryID) > 128 {
-		return tigerbeetle.Uint128{}, errors.New("entry_id must be canonical non-empty text")
-	}
-	digest := sha256.Sum256([]byte("outcome-ledger:" + entryID))
-	var bytes [16]byte
-	copy(bytes[:], digest[:16])
-	return tigerbeetle.BytesToUint128(bytes), nil
-}
-
-// TransferIDHex renders the transfer id for the immutable DB record
-// (32 lowercase hex characters, matching the DB CHECK).
-func TransferIDHex(id tigerbeetle.Uint128) string {
-	bytes := id.Bytes()
-	const digits = "0123456789abcdef"
-	out := make([]byte, 0, 32)
-	// Uint128.Bytes is little-endian; render big-endian for readability.
-	for index := len(bytes) - 1; index >= 0; index-- {
-		out = append(out, digits[bytes[index]>>4], digits[bytes[index]&0x0f])
-	}
-	return string(out)
-}
-
-// PostOutcome posts one outcome transfer binding incident-reduction evidence
-// to premium-delta evidence. Amount is the entry quantity (incident count or
-// basis points). Any TigerBeetle failure aborts the confirmation.
-func (service *Service) PostOutcome(entryID string, quantity uint64) (tigerbeetle.Uint128, error) {
-	transferID, err := EntryTransferID(entryID)
-	if err != nil {
-		return tigerbeetle.Uint128{}, err
-	}
+// PostOutcome posts the deterministic double-entry transfer for one
+// confirmed entry. The transfer id derives from the entry id, so a retried
+// confirmation after a crash posts the same transfer idempotently.
+func (service *Service) PostOutcome(entryID string, quantity uint64) (types.Uint128, error) {
 	if quantity == 0 {
-		return tigerbeetle.Uint128{}, errors.New("outcome quantity must be non-zero")
+		return types.Uint128{}, errors.New("quantity must be positive")
 	}
-	results, err := service.client.CreateTransfers([]tigerbeetle.Transfer{{
+	transferID, err := transferIDFor(entryID)
+	if err != nil {
+		return types.Uint128{}, err
+	}
+	results, err := service.client.CreateTransfers([]types.Transfer{{
 		ID:              transferID,
-		DebitAccountID:  IncidentReductionAccountID,
-		CreditAccountID: PremiumDeltaAccountID,
-		Amount:          tigerbeetle.ToUint128(quantity),
-		Ledger:          service.ledger,
-		Code:            service.code,
+		DebitAccountID:  service.accountA,
+		CreditAccountID: service.accountB,
+		Amount:          types.ToUint128(quantity),
+		Ledger:          service.ledgerID,
+		Code:            ledgerCodeOutcome,
 	}})
 	if err != nil {
-		return tigerbeetle.Uint128{}, fmt.Errorf("post outcome transfer: %w", err)
+		return types.Uint128{}, fmt.Errorf("post outcome transfer: %w", err)
 	}
-	if len(results) > 1 {
-		return tigerbeetle.Uint128{}, fmt.Errorf("post outcome transfer returned %d failures, want at most 1", len(results))
-	}
-	if len(results) == 1 && results[0].Status != tigerbeetle.TransferCreated && results[0].Status != tigerbeetle.TransferExists {
-		return tigerbeetle.Uint128{}, fmt.Errorf("post outcome transfer returned %v", results[0].Status)
+	for _, result := range results {
+		if result.Result != types.TransferExists {
+			return types.Uint128{}, fmt.Errorf("post outcome transfer %d: %s", result.Index, result.Result.String())
+		}
 	}
 	return transferID, nil
+}
+
+// transferIDFor deterministically maps an entry id to a uint128 transfer id
+// (first 16 bytes of sha256, big-endian).
+func transferIDFor(entryID string) (types.Uint128, error) {
+	if entryID == "" {
+		return types.Uint128{}, errors.New("entry id is required")
+	}
+	digest := sha256First16(entryID)
+	return types.BytesToUint128(digest), nil
+}
+
+// TransferIDHex renders a transfer id as the 32-char lowercase hex string
+// persisted on the immutable ledger record.
+func TransferIDHex(id types.Uint128) string {
+	raw := id.Bytes()
+	const hexdigits = "0123456789abcdef"
+	out := make([]byte, 32)
+	for i, b := range raw {
+		out[i*2] = hexdigits[b>>4]
+		out[i*2+1] = hexdigits[b&0x0f]
+	}
+	return string(out)
 }
