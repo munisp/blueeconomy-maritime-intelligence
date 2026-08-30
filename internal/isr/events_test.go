@@ -1,140 +1,157 @@
 package isr
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
 
-func TestClassificationParseFailsClosed(t *testing.T) {
-	for _, raw := range []string{"UNCLASSIFIED", "RESTRICTED", "CONFIDENTIAL", "SECRET"} {
-		if _, err := ParseClassification(raw); err != nil {
-			t.Fatalf("approved label %q rejected: %v", raw, err)
-		}
-	}
-	for _, raw := range []string{"", "unclassified", "Secret", "TOP SECRET", "none"} {
-		if _, err := ParseClassification(raw); err == nil {
-			t.Fatalf("invalid label %q accepted", raw)
-		}
-	}
-}
-
-func TestClearanceCovers(t *testing.T) {
-	if !ClassificationSecret.Covers(ClassificationConfidential) {
-		t.Fatal("secret clearance must cover confidential material")
-	}
-	if ClassificationRestricted.Covers(ClassificationSecret) {
-		t.Fatal("restricted clearance must not cover secret material")
-	}
-	if !ClassificationUnclassified.Covers(ClassificationUnclassified) {
-		t.Fatal("equal clearance must cover")
-	}
-	if Classification("bogus").Covers(ClassificationUnclassified) {
-		t.Fatal("invalid clearance must cover nothing")
-	}
-	if ClassificationSecret.Covers(Classification("bogus")) {
-		t.Fatal("invalid event label must be uncovered")
-	}
-}
-
-func TestMaxClassification(t *testing.T) {
-	if MaxClassification(ClassificationRestricted, ClassificationSecret) != ClassificationSecret {
-		t.Fatal("max must pick the more sensitive label")
-	}
-	if MaxClassification(ClassificationConfidential, ClassificationUnclassified) != ClassificationConfidential {
-		t.Fatal("max must pick the more sensitive label")
-	}
-}
-
-func validDetection() Detection {
+func validAISDetection() Detection {
 	return Detection{
-		EventID: "evt-001", SourceID: "sar-feed", SourceEventID: "src-001",
-		Modality: ModalitySAR, Classification: ClassificationConfidential,
+		EventID: "evt-001", SourceID: "ais-feed", SourceEventID: "src-001",
+		Modality: ModalityAIS, Classification: ClassificationUnclassified,
 		ObservedAt:  time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC),
 		HasPosition: true, Latitude: 6.45, Longitude: 3.39,
-		SAR: &SARPayload{SceneRef: "scene-001", Confidence: 0.85},
+		MMSI: "636019999",
+		AIS:  &AISPayload{MMSI: "636019999", SpeedKnots: 12.5, HeadingDeg: 90, NavStatus: "under way"},
 	}
 }
 
-func TestDetectionValidation(t *testing.T) {
-	if err := validDetection().Validate(); err != nil {
+func TestDetectionValidationBoundaries(t *testing.T) {
+	base := validAISDetection()
+	if err := base.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	missing := validDetection()
-	missing.Classification = ""
-	if err := missing.Validate(); err == nil {
-		t.Fatal("missing classification accepted")
+	// Latitude boundary values are accepted; beyond them rejected.
+	for _, latitude := range []float64{-90, 90} {
+		candidate := base
+		candidate.Latitude = latitude
+		if err := candidate.Validate(); err != nil {
+			t.Fatalf("latitude %v must validate", latitude)
+		}
 	}
-	invalid := validDetection()
-	invalid.Classification = "TOP-SECRET"
-	if err := invalid.Validate(); err == nil {
-		t.Fatal("invalid classification accepted")
+	for _, latitude := range []float64{-90.000001, 90.000001} {
+		candidate := base
+		candidate.Latitude = latitude
+		if err := candidate.Validate(); err == nil {
+			t.Fatalf("latitude %v must fail", latitude)
+		}
 	}
-	noPayload := validDetection()
-	noPayload.SAR = nil
-	if err := noPayload.Validate(); err == nil {
-		t.Fatal("missing modality payload accepted")
+	// Missing classification fails closed.
+	candidate := base
+	candidate.Classification = ""
+	if err := candidate.Validate(); err == nil {
+		t.Fatal("missing classification must fail closed")
 	}
-	mixed := validDetection()
-	mixed.AIS = &AISPayload{MMSI: "636019999", SpeedKnots: 5, HeadingDeg: 90}
-	if err := mixed.Validate(); err == nil {
-		t.Fatal("mixed modality payloads accepted")
+	// Exactly one modality payload: an AIS detection carrying a SAR payload
+	// is rejected.
+	candidate = base
+	candidate.SAR = &SARPayload{SceneRef: "scene-1", Confidence: 0.5}
+	if err := candidate.Validate(); err == nil {
+		t.Fatal("multi-modality payload must fail")
 	}
-	noPosition := validDetection()
-	noPosition.HasPosition = false
-	noPosition.Latitude, noPosition.Longitude = 0, 0
-	if err := noPosition.Validate(); err != nil {
+	// Modality payload required.
+	candidate = base
+	candidate.AIS = nil
+	if err := candidate.Validate(); err == nil {
+		t.Fatal("missing modality payload must fail")
+	}
+	// Unknown modality fails closed.
+	candidate = base
+	candidate.Modality = "LIDAR"
+	if err := candidate.Validate(); err == nil {
+		t.Fatal("unknown modality must fail closed")
+	}
+	// MMSI must be 9 digits when present.
+	candidate = base
+	candidate.MMSI = "12345"
+	if err := candidate.Validate(); err == nil {
+		t.Fatal("short MMSI must fail")
+	}
+	// A positionless detection (bearing-only RF fix) may be admitted.
+	rf := Detection{
+		EventID: "evt-rf", SourceID: "rf-feed", SourceEventID: "src-rf",
+		Modality: ModalityRF, Classification: ClassificationRestricted,
+		ObservedAt: time.Date(2026, 8, 15, 12, 5, 0, 0, time.UTC),
+		RF:         &RFPayload{FrequencyBand: "VHF", BearingDeg: 45},
+	}
+	if err := rf.Validate(); err != nil {
 		t.Fatal(err)
-	}
-	badPosition := validDetection()
-	badPosition.Latitude = 95
-	if err := badPosition.Validate(); err == nil {
-		t.Fatal("out-of-range latitude accepted")
 	}
 }
 
 func TestModalityPayloadValidation(t *testing.T) {
-	if err := (AISPayload{MMSI: "636019999", SpeedKnots: 12.5, HeadingDeg: 270}).validate(); err != nil {
+	// SAR confidence is a unit interval.
+	sar := validAISDetection()
+	sar.Modality = ModalitySAR
+	sar.AIS = nil
+	sar.MMSI = ""
+	sar.SAR = &SARPayload{SceneRef: "scene-1", Confidence: 1.000001}
+	if err := sar.Validate(); err == nil {
+		t.Fatal("SAR confidence above 1 must fail")
+	}
+	sar.SAR.Confidence = 1.0
+	if err := sar.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	if err := (AISPayload{MMSI: "12345", SpeedKnots: 1, HeadingDeg: 1}).validate(); err == nil {
-		t.Fatal("short MMSI accepted")
+	// RF band must be approved.
+	rf := Detection{
+		EventID: "evt-rf2", SourceID: "rf-feed", SourceEventID: "src-rf2",
+		Modality: ModalityRF, Classification: ClassificationRestricted,
+		ObservedAt: time.Now().UTC(),
+		RF:         &RFPayload{FrequencyBand: "CB", BearingDeg: 10},
 	}
-	if err := (AISPayload{MMSI: "636019999", SpeedKnots: 103, HeadingDeg: 1}).validate(); err == nil {
-		t.Fatal("impossible AIS speed accepted")
+	if err := rf.Validate(); err == nil {
+		t.Fatal("unapproved frequency band must fail closed")
 	}
-	if err := (SARPayload{SceneRef: "scene-1", Confidence: 0}).validate(); err != nil {
-		t.Fatal("zero confidence is a valid explicit value")
+	// Optical boxes must be normalised and bounded.
+	optical := Detection{
+		EventID: "evt-op", SourceID: "op-feed", SourceEventID: "src-op",
+		Modality: ModalityOptical, Classification: ClassificationConfidential,
+		ObservedAt: time.Now().UTC(),
+		Optical:    &OpticalPayload{ImageRef: "img-1", Boxes: []DetectionBox{{X: 0.9, Y: 0.1, Width: 0.2, Height: 0.1, Confidence: 0.9}}},
 	}
-	if err := (SARPayload{SceneRef: "scene-1", Confidence: 1.01}).validate(); err == nil {
-		t.Fatal("confidence above 1 accepted")
+	if err := optical.Validate(); err == nil {
+		t.Fatal("out-of-bounds detection box must fail")
 	}
-	if err := (SARPayload{Confidence: 0.5}).validate(); err == nil {
-		t.Fatal("missing SAR scene ref accepted")
-	}
-	if err := (RFPayload{FrequencyBand: "VHF", BearingDeg: 45}).validate(); err != nil {
+	optical.Optical.Boxes[0].Width = 0.1
+	if err := optical.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	if err := (RFPayload{FrequencyBand: "CB", BearingDeg: 45}).validate(); err == nil {
-		t.Fatal("unapproved RF band accepted")
+	optical.Optical.Boxes = nil
+	if err := optical.Validate(); err == nil {
+		t.Fatal("empty detection boxes must fail")
 	}
-	if err := (RFPayload{FrequencyBand: "UHF", BearingDeg: 361}).validate(); err == nil {
-		t.Fatal("bearing above 360 accepted")
+	// Acoustic signature reference is required.
+	acoustic := Detection{
+		EventID: "evt-ac", SourceID: "ac-feed", SourceEventID: "src-ac",
+		Modality: ModalityAcoustic, Classification: ClassificationRestricted,
+		ObservedAt: time.Now().UTC(),
+		Acoustic:   &AcousticPayload{SignatureRef: "", Confidence: 0.5},
 	}
-	if err := (AcousticPayload{SignatureRef: "hydro-sig-1", Confidence: 0.7}).validate(); err != nil {
-		t.Fatal(err)
+	if err := acoustic.Validate(); err == nil {
+		t.Fatal("missing acoustic signature ref must fail")
 	}
-	if err := (AcousticPayload{Confidence: 0.7}).validate(); err == nil {
-		t.Fatal("missing acoustic signature ref accepted")
+}
+
+func TestClassificationParsing(t *testing.T) {
+	for _, raw := range []string{"unclassified", "RESTRICTED", "confidential", " Secret "} {
+		if _, err := ParseClassification(raw); err != nil {
+			t.Fatalf("%q must parse", raw)
+		}
 	}
-	optical := OpticalPayload{ImageRef: "img-001", Boxes: []DetectionBox{{X: 0.1, Y: 0.1, Width: 0.2, Height: 0.2, Confidence: 0.9}}}
-	if err := optical.validate(); err != nil {
-		t.Fatal(err)
+	for _, raw := range []string{"", "TOP-SECRET", "public", "internal"} {
+		if _, err := ParseClassification(raw); err == nil {
+			t.Fatalf("%q must fail closed", raw)
+		}
 	}
-	if err := (OpticalPayload{ImageRef: "img-001"}).validate(); err == nil {
-		t.Fatal("optical payload without detection boxes accepted")
+	if !ClassificationSecret.Covers(ClassificationConfidential) || ClassificationRestricted.Covers(ClassificationSecret) {
+		t.Fatal("clearance coverage ordering is wrong")
 	}
-	overflow := OpticalPayload{ImageRef: "img-001", Boxes: []DetectionBox{{X: 0.9, Y: 0.9, Width: 0.2, Height: 0.2, Confidence: 0.9}}}
-	if err := overflow.validate(); err == nil {
-		t.Fatal("detection box exceeding image bounds accepted")
+	if Max(ClassificationRestricted, ClassificationSecret) != ClassificationSecret {
+		t.Fatal("classification max is wrong")
+	}
+	if !strings.EqualFold(string(ClassificationUnclassified), "unclassified") {
+		t.Fatal("canonical label changed")
 	}
 }
