@@ -169,7 +169,7 @@ func (store *Store) GetSitrep(ctx context.Context, caseID, sitrepID string) (Sit
 	var sitrep Sitrep
 	err := store.pool.QueryRow(ctx, `
 		SELECT sitrep_id, case_id, sequence, body, body_sha256, envelope_jws, issued_by, issued_at
-		FROM sar_sitreps WHERE case_id=$1 AND sitrepID=$2`, caseID, sitrepID).
+		FROM sar_sitreps WHERE case_id=$1 AND sitrep_id=$2`, caseID, sitrepID).
 		Scan(&sitrep.SitrepID, &sitrep.CaseID, &sitrep.Sequence, &sitrep.Body,
 			&sitrep.BodySHA256, &sitrep.EnvelopeJWS, &sitrep.IssuedBy, &sitrep.IssuedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
