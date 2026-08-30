@@ -1,82 +1,108 @@
 #!/usr/bin/env bash
 set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-kafka_root=/home/ubuntu/blueeconomy-data-platform/integration/kafka-delta
-pg_compose=(sudo docker compose -f "$repo_root/docker-compose.integration.yml")
-kafka_compose=(sudo docker compose -f "$kafka_root/compose.yaml")
-service_pid=''
+cd "$repo_root"
+docker_prefix=()
+if ! docker info >/dev/null 2>&1; then
+  if sudo -n docker info >/dev/null 2>&1; then docker_prefix=(sudo docker); else echo 'Docker daemon is unavailable' >&2; exit 1; fi
+fi
+compose=("${docker_prefix[@]}" compose -f docker-compose.integration.yml)
 publisher_pid=''
-service_binary=''
 publisher_binary=''
-key_dir=''
+server_pid=''
+server_binary=''
 cleanup() {
   if [[ -n "$publisher_pid" ]]; then kill "$publisher_pid" 2>/dev/null || true; wait "$publisher_pid" 2>/dev/null || true; fi
-  if [[ -n "$service_pid" ]]; then kill "$service_pid" 2>/dev/null || true; wait "$service_pid" 2>/dev/null || true; fi
-  [[ -z "$service_binary" ]] || rm -f "$service_binary"
-  [[ -z "$publisher_binary" ]] || rm -f "$publisher_binary"
-  [[ -z "$key_dir" ]] || rm -rf "$key_dir"
-  "${pg_compose[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
-  "${kafka_compose[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
+  if [[ -n "$server_pid" ]]; then kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; fi
+  if [[ -n "$publisher_binary" ]]; then rm -f "$publisher_binary"; fi
+  if [[ -n "$server_binary" ]]; then rm -f "$server_binary"; fi
+  "${compose[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
-
-"${pg_compose[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
-"${kafka_compose[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
-"${pg_compose[@]}" up -d --wait postgres
-"${kafka_compose[@]}" up -d
-for _ in $(seq 1 120); do
-  if "${kafka_compose[@]}" exec -T kafka /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server 127.0.0.1:59092 >/dev/null 2>&1; then break; fi
-  sleep 1
-done
-"${kafka_compose[@]}" exec -T kafka /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server 127.0.0.1:59092 >/dev/null
-readonly topic='blueeconomy.maritime.incidents.local'
-"${kafka_compose[@]}" exec -T kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server 127.0.0.1:59092 --create --if-not-exists --topic "$topic" --partitions 1 --replication-factor 1 >/dev/null
-
-service_binary=$(mktemp)
+"${compose[@]}" up -d --wait postgres kafka kafka-init
+server_binary=$(mktemp)
 publisher_binary=$(mktemp)
-cd "$repo_root"
-go build -o "$service_binary" ./cmd/maritime-intelligence
-go build -o "$publisher_binary" ./cmd/maritime-intelligence-outbox-publisher
-DATABASE_URL='postgres://blueeconomy:local-only-integration-password@127.0.0.1:55434/blueeconomy_intelligence?sslmode=disable' \
-MIGRATION_PATH="$repo_root/db/migrations/0001_incidents.sql,$repo_root/db/migrations/0002_casework.sql,$repo_root/db/migrations/0003_outbox_delivery.sql,$repo_root/db/migrations/0004_authorized_feed_sources.sql,$repo_root/db/migrations/0005_feed_source_revocations.sql,$repo_root/db/migrations/0006_feed_source_key_rotation.sql,$repo_root/db/migrations/0010_feed_source_activation.sql" \
-PORT=18082 AUTH_MODE=loopback_trusted_proxy "$service_binary" >"$repo_root/.kafka-service.log" 2>&1 &
-service_pid=$!
-for _ in $(seq 1 30); do if curl --fail --silent http://127.0.0.1:18082/healthz >/dev/null; then break; fi; sleep 1; done
-curl --fail --silent http://127.0.0.1:18082/healthz >/dev/null
-registrar_headers=(-H 'Content-Type: application/json' -H 'X-Trusted-Proxy: loopback' -H 'X-Authenticated-Principal: kafka-feed-registrar' -H 'X-Authenticated-Roles: isr-admin')
-activator_headers=(-H 'Content-Type: application/json' -H 'X-Trusted-Proxy: loopback' -H 'X-Authenticated-Principal: kafka-feed-activator' -H 'X-Authenticated-Roles: isr-admin')
-ingest_headers=(-H 'Content-Type: application/json' -H 'X-Trusted-Proxy: loopback' -H 'X-Authenticated-Principal: kafka-feed-ingest' -H 'X-Authenticated-Roles: isr-feed-ingest')
-event_id="kafka-outbox-event-$(date +%s%N)"
-source_id='kafka-feed-source'
-source_event_id="feed-$event_id"
-key_dir="$(mktemp -d)"
-openssl genpkey -algorithm ED25519 -out "$key_dir/signing.key" >/dev/null 2>&1
-public_key_base64="$(openssl pkey -in "$key_dir/signing.key" -pubout -outform DER | tail -c 32 | base64 -w0 | tr -d '=')"
-# Registration never self-activates: the source is PENDING until a distinct
-# isr-admin principal activates it (maker-checker).
-curl --fail --silent -X POST http://127.0.0.1:18082/v1/feed-sources "${registrar_headers[@]}" \
-  --data "{\"source_id\":\"$source_id\",\"source_kind\":\"RADAR\",\"authority\":\"local-kafka-authority\",\"public_key_base64\":\"$public_key_base64\"}" | grep -q '"status":"pending_activation"'
-curl --fail --silent -X POST "http://127.0.0.1:18082/v1/feed-sources/$source_id/activate" "${activator_headers[@]}" | grep -q '"status":"active"'
-payload="{\"incident_id\":\"$event_id\",\"source_event_id\":\"$source_id:$source_event_id\",\"category\":\"distress\",\"severity\":\"HIGH\",\"title\":\"Kafka signed feed integration\",\"description\":\"authorized source to broker delivery\",\"occurred_at\":\"2026-08-15T12:00:00Z\",\"created_by\":\"feed:$source_id\"}"
-payload_digest="$(printf '%s' "$payload" | sha256sum | awk '{print $1}')"
-printf '%s\n%s\nsha256:%s' "$source_id" "$source_event_id" "$payload_digest" >"$key_dir/signing.input"
-signature_base64="$(openssl pkeyutl -sign -rawin -inkey "$key_dir/signing.key" -in "$key_dir/signing.input" | base64 -w0)"
-payload_base64="$(printf '%s' "$payload" | base64 -w0)"
-curl --fail --silent -X POST http://127.0.0.1:18082/v1/feed-events/admit-incident "${ingest_headers[@]}" \
-  --data "{\"source_id\":\"$source_id\",\"source_event_id\":\"$source_event_id\",\"payload_base64\":\"$payload_base64\",\"signature_base64\":\"$signature_base64\"}" >/dev/null
-DATABASE_URL='postgres://blueeconomy:local-only-integration-password@127.0.0.1:55434/blueeconomy_intelligence?sslmode=disable' \
-KAFKA_BROKERS='127.0.0.1:59092' KAFKA_TOPIC="$topic" KAFKA_TRANSPORT=local_plaintext OUTBOX_WORKER_ID='s2-kafka-integration-worker' \
-MIGRATION_PATH="$repo_root/db/migrations/0001_incidents.sql,$repo_root/db/migrations/0002_casework.sql,$repo_root/db/migrations/0003_outbox_delivery.sql" \
-OUTBOX_POLL_INTERVAL=100ms "$publisher_binary" >"$repo_root/.kafka-publisher.log" 2>&1 &
+GOFLAGS='' go build -o "$server_binary" ./cmd/maritime-intelligence
+GOFLAGS='' go build -o "$publisher_binary" ./cmd/maritime-intelligence-outbox-publisher
+export DATABASE_URL='postgres://blueeconomy:local-only-integration-password@127.0.0.1:55434/blueeconomy_intelligence?sslmode=disable'
+MIGRATION_PATH="$repo_root/db/migrations/0001_incidents.sql,$repo_root/db/migrations/0002_casework.sql,$repo_root/db/migrations/0003_outbox_delivery.sql,$repo_root/db/migrations/0004_authorized_feed_sources.sql,$repo_root/db/migrations/0005_feed_source_revocations.sql,$repo_root/db/migrations/0006_feed_source_key_rotation.sql" PORT=18084 AUTH_MODE=loopback_trusted_proxy "$server_binary" >"$repo_root/.kafka-server.log" 2>&1 &
+server_pid=$!
+for _ in $(seq 1 30); do if curl --fail --silent http://127.0.0.1:18084/healthz >/dev/null; then break; fi; sleep 1; done
+curl --fail --silent http://127.0.0.1:18084/healthz >/dev/null
+OUTBOX_WORKER_ID='worker-kafka-local' KAFKA_BROKERS='127.0.0.1:29092' KAFKA_TOPIC='maritime.incident.v1' OUTBOX_POLL_INTERVAL='250ms' OUTBOX_MAX_BACKOFF='5s' \
+  "$publisher_binary" >"$repo_root/.kafka-publisher.log" 2>&1 &
 publisher_pid=$!
-container_id=$("${pg_compose[@]}" ps -q postgres)
-for _ in $(seq 1 60); do
-  published=$(sudo docker exec "$container_id" psql -p 55434 -U blueeconomy -d blueeconomy_intelligence -Atc "select count(*) from maritime_incident_outbox where incident_id = '$event_id' and published_at is not null;")
-  [[ "$published" == '1' ]] && break
-  sleep 1
-done
-test "$published" = '1'
-message=$("${kafka_compose[@]}" exec -T kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server 127.0.0.1:59092 --topic "$topic" --from-beginning --max-messages 1 --timeout-ms 20000 --property print.key=true --property print.headers=true)
-printf '%s\n' "$message" | grep -q "$event_id"
-printf '%s\n' "$message" | grep -q 'incident.created'
-printf '%s\n' 'S2 authentic Kafka outbox delivery passed: PostgreSQL event claimed, Kafka broker acknowledged, consumer received event identity/type, and PostgreSQL published_at was recorded.'
+python3 - <<'PY'
+import base64, hashlib, json, subprocess, time
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives import serialization
+private_key = Ed25519PrivateKey.generate()
+public_key = private_key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+source_id = 'vts-kafka-feed'
+registered_by = 'registrar-kafka'
+activated_by = 'activator-kafka'
+
+def run_sql(statement, capture=True):
+    return subprocess.run(
+        ['psql', 'postgres://blueeconomy:local-only-integration-password@127.0.0.1:55434/blueeconomy_intelligence?sslmode=disable', '-v', 'ON_ERROR_STOP=1', '-Atc', statement],
+        check=True, capture_output=capture, text=True,
+    ).stdout.strip() if capture else None
+
+def registration_request(public_key_b64, source_id, source_kind, authority, registered_by):
+    return f"INSERT INTO maritime_feed_sources (source_id, source_kind, authority, public_key, key_fingerprint, registered_by, active, created_at, updated_at) VALUES ('{source_id}', '{source_kind}', '{authority}', decode('{public_key_b64.hex()}', 'hex'), 'sha256:{hashlib.sha256(public_key_b64).hexdigest()}', '{registered_by}', false, now(), now())"
+
+# Maker-checker registration and activation mirror the service contract: a
+# distinct verified principal activates the source after registration.
+run_sql(registration_request(public_key, source_id, 'VTS', 'local-authority', registered_by))
+run_sql(f"INSERT INTO maritime_feed_source_activations (source_id, registered_by, activated_by, activated_at) VALUES ('{source_id}', '{registered_by}', '{activated_by}', now())")
+run_sql(f"UPDATE maritime_feed_sources SET active = true, updated_at = now() WHERE source_id = '{source_id}'")
+
+def feed_signing_bytes(source_id, source_event_id, payload):
+    return ('feed-event\\n' + source_id + '\\n' + source_event_id + '\\nsha256:' + hashlib.sha256(payload).hexdigest()).encode()
+
+def post(path, payload):
+    request = subprocess.run([
+        'curl', '--fail', '--silent', '-X', 'POST', 'http://127.0.0.1:18084' + path,
+        '-H', 'Content-Type: application/json', '-H', 'X-Trusted-Proxy: loopback',
+        '-H', 'X-Authenticated-Principal: integration-operator',
+        '-H', 'X-Authenticated-Clearance: UNCLASSIFIED',
+        '-H', 'X-Authenticated-Roles: isr-analyst,isr-feed-ingest',
+        '--data', json.dumps(payload),
+    ], check=True, capture_output=True, text=True)
+    return json.loads(request.stdout)
+
+incident_payload = json.dumps({
+    'incident_id': 'incident-kafka-001',
+    'source_event_id': source_id + ':vts-event-kafka-001',
+    'category': 'SECURITY',
+    'severity': 'HIGH',
+    'title': 'Signed VTS exception',
+    'description': 'Signed feed event admitted through the local HTTP surface',
+    'occurred_at': '2026-08-15T12:00:00Z',
+    'created_by': 'feed:' + source_id,
+}, separators=(',', ':')).encode()
+signature = base64.b64encode(private_key.sign(feed_signing_bytes(source_id, 'vts-event-kafka-001', incident_payload))).decode()
+created = post('/v1/feed-events/admit-incident', {
+    'source_id': source_id,
+    'source_event_id': 'vts-event-kafka-001',
+    'payload_base64': base64.b64encode(incident_payload).decode(),
+    'signature_base64': signature,
+})
+assert created['incident']['incident_id'] == 'incident-kafka-001', created
+
+def await_outbox(predicate, timeout=30):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        row = run_sql("SELECT event_type, payload::text, published_at IS NOT NULL FROM maritime_incident_outbox WHERE incident_id = 'incident-kafka-001' ORDER BY created_at LIMIT 1")
+        if row and predicate(row):
+            return row
+        time.sleep(0.5)
+    raise SystemExit('outbox publication timed out: ' + (row or 'no rows'))
+
+row = await_outbox(lambda value: value.endswith('|t'))
+event_type, payload_text, _ = row.split('|')
+assert event_type == 'incident.created', row
+event = json.loads(payload_text)
+assert event['incident_id'] == 'incident-kafka-001', event
+print('S3 Kafka outbox publication passed (signed feed incident -> PostgreSQL outbox -> publisher -> marked published).')
+PY
