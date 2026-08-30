@@ -1,0 +1,35 @@
+{
+  "envelopeVersion": "1.0",
+  "eventId": "evt-sar-000005",
+  "eventType": "maritime.sar.sitrep_issued.v1",
+  "occurredAt": "2026-08-29T14:00:00Z",
+  "producer": "blueeconomy-maritime-intelligence",
+  "correlationId": "corr-sar-000005",
+  "fhir": {
+    "resourceType": "Bundle",
+    "type": "message",
+    "bundleId": "bdl-sar-000005",
+    "entry": [
+      {
+        "fullUrl": "urn:uuid:8186cc9f-ffb4-5d14-821e-c53900907eeb",
+        "resource": {
+          "@type": "type.googleapis.com/blueeconomy.contracts.v1.SarSitrepIssued",
+          "sitrepId": "sitrep-000001",
+          "caseId": "sar-000001",
+          "sequence": 1,
+          "bodyDigestSha256": "sha256:d84d9ec6f59e22f2dd7cad030e6f4e2effae94ecea79fbdd7d0f9df12d81f77e",
+          "envelopeDigestSha256": "sha256:34ea991b6d12cf32cdba59e2cfe5f8b592b5bf7c00f566321040490c6422abe4",
+          "issuedAt": "2026-08-29T14:00:00Z"
+        }
+      }
+    ]
+  },
+  "provenance": {
+    "principalId": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+    "principalRole": "sar-producer",
+    "ledgerCommitHash": "",
+    "signature": "eyJhbGciOiJFZERTQSIsImtpZCI6ImJsdWVlY29ub215LW1hcml0aW1lLWludGVsbGlnZW5jZS0wIn0.eyJjbGFzc2lmaWNhdGlvbiI6IlJFU1RSSUNURUQiLCJjb3JyZWxhdGlvbklkIjoiY29yci1zYXItMDAwMDA1IiwiZW52ZWxvcGVWZXJzaW9uIjoiMS4wIiwiZXZlbnRJZCI6ImV2dC1zYXItMDAwMDA1IiwiZXZlbnRUeXBlIjoibWFyaXRpbWUuc2FyLnNpdHJlcF9pc3N1ZWQudjEiLCJmaGlyIjp7ImJ1bmRsZUlkIjoiYmRsLXNhci0wMDAwMDUiLCJlbnRyeSI6W3siZnVsbFVybCI6InVybjp1dWlkOjgxODZjYzlmLWZmYjQtNWQxNC04MjFlLWM1MzkwMDkwN2VlYiIsInJlc291cmNlIjp7IkB0eXBlIjoidHlwZS5nb29nbGVhcGlzLmNvbS9ibHVlZWNvbm9teS5jb250cmFjdHMudjEuU2FyU2l0cmVwSXNzdWVkIiwiYm9keURpZ2VzdFNoYTI1NiI6InNoYTI1NjpkODRkOWVjNmY1OWUyMmYyZGQ3Y2FkMDMwZTZmNGUyZWZmYWU5NGVjZWE3OWZiZGQ3ZDBmOWRmMTJkODFmNzdlIiwiY2FzZUlkIjoic2FyLTAwMDAwMSIsImVudmVsb3BlRGlnZXN0U2hhMjU2Ijoic2hhMjU2OjM0ZWE5OTFiNmQxMmNmMzJjZGJhNTllMmNmZTVmOGI1OTJiNWJmN2MwMGY1NjYzMjEwNDA0OTBjNjQyMmFiZTQiLCJpc3N1ZWRBdCI6IjIwMjYtMDgtMjlUMTQ6MDA6MDBaIiwic2VxdWVuY2UiOjEsInNpdHJlcElkIjoic2l0cmVwLTAwMDAwMSJ9fV0sInJlc291cmNlVHlwZSI6IkJ1bmRsZSIsInR5cGUiOiJtZXNzYWdlIn0sIm9jY3VycmVkQXQiOiIyMDI2LTA4LTI5VDE0OjAwOjAwWiIsInByb2R1Y2VyIjoiYmx1ZWVjb25vbXktbWFyaXRpbWUtaW50ZWxsaWdlbmNlIiwicHJvdmVuYW5jZSI6eyJsZWRnZXJDb21taXRIYXNoIjoiIiwicHJpbmNpcGFsSWQiOiJmNDdhYzEwYi01OGNjLTQzNzItYTU2Ny0wZTAyYjJjM2Q0NzkiLCJwcmluY2lwYWxSb2xlIjoic2FyLXByb2R1Y2VyIn0sInJlY29yZENsYXNzaWZpY2F0aW9uIjoiUkVTVFJJQ1RFRCJ9.sCFbQAC4F9pUJjIDe4rr1Y0uhhsyEUHgvHrwXnY_1aDJk_W849ZAayjjXgOnD_1wiPFkSI519S1jw89OSlVcBw"
+  },
+  "classification": "RESTRICTED",
+  "recordClassification": "RESTRICTED"
+}

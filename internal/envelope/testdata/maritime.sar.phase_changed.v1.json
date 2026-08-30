@@ -1,0 +1,34 @@
+{
+  "envelopeVersion": "1.0",
+  "eventId": "evt-sar-000002",
+  "eventType": "maritime.sar.phase_changed.v1",
+  "occurredAt": "2026-08-29T14:00:00Z",
+  "producer": "blueeconomy-maritime-intelligence",
+  "correlationId": "corr-sar-000002",
+  "fhir": {
+    "resourceType": "Bundle",
+    "type": "message",
+    "bundleId": "bdl-sar-000002",
+    "entry": [
+      {
+        "fullUrl": "urn:uuid:b3250011-0d00-55e7-aba3-7720a0fb335e",
+        "resource": {
+          "@type": "type.googleapis.com/blueeconomy.contracts.v1.SarPhaseChanged",
+          "caseId": "sar-000001",
+          "priorPhase": "INCERFA",
+          "phase": "ALERFA",
+          "rationaleDigestSha256": "sha256:abd73696da29ac19ee791d7613cad0278b361dc1186e9b580684ea1e25124f2b",
+          "changedAt": "2026-08-29T13:02:44Z"
+        }
+      }
+    ]
+  },
+  "provenance": {
+    "principalId": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+    "principalRole": "sar-producer",
+    "ledgerCommitHash": "",
+    "signature": "eyJhbGciOiJFZERTQSIsImtpZCI6ImJsdWVlY29ub215LW1hcml0aW1lLWludGVsbGlnZW5jZS0wIn0.eyJjbGFzc2lmaWNhdGlvbiI6IlJFU1RSSUNURUQiLCJjb3JyZWxhdGlvbklkIjoiY29yci1zYXItMDAwMDAyIiwiZW52ZWxvcGVWZXJzaW9uIjoiMS4wIiwiZXZlbnRJZCI6ImV2dC1zYXItMDAwMDAyIiwiZXZlbnRUeXBlIjoibWFyaXRpbWUuc2FyLnBoYXNlX2NoYW5nZWQudjEiLCJmaGlyIjp7ImJ1bmRsZUlkIjoiYmRsLXNhci0wMDAwMDIiLCJlbnRyeSI6W3siZnVsbFVybCI6InVybjp1dWlkOmIzMjUwMDExLTBkMDAtNTVlNy1hYmEzLTc3MjBhMGZiMzM1ZSIsInJlc291cmNlIjp7IkB0eXBlIjoidHlwZS5nb29nbGVhcGlzLmNvbS9ibHVlZWNvbm9teS5jb250cmFjdHMudjEuU2FyUGhhc2VDaGFuZ2VkIiwiY2FzZUlkIjoic2FyLTAwMDAwMSIsImNoYW5nZWRBdCI6IjIwMjYtMDgtMjlUMTM6MDI6NDRaIiwicGhhc2UiOiJBTEVSRkEiLCJwcmlvclBoYXNlIjoiSU5DRVJGQSIsInJhdGlvbmFsZURpZ2VzdFNoYTI1NiI6InNoYTI1NjphYmQ3MzY5NmRhMjlhYzE5ZWU3OTFkNzYxM2NhZDAyNzhiMzYxZGMxMTg2ZTliNTgwNjg0ZWExZTI1MTI0ZjJiIn19XSwicmVzb3VyY2VUeXBlIjoiQnVuZGxlIiwidHlwZSI6Im1lc3NhZ2UifSwib2NjdXJyZWRBdCI6IjIwMjYtMDgtMjlUMTQ6MDA6MDBaIiwicHJvZHVjZXIiOiJibHVlZWNvbm9teS1tYXJpdGltZS1pbnRlbGxpZ2VuY2UiLCJwcm92ZW5hbmNlIjp7ImxlZGdlckNvbW1pdEhhc2giOiIiLCJwcmluY2lwYWxJZCI6ImY0N2FjMTBiLTU4Y2MtNDM3Mi1hNTY3LTBlMDJiMmMzZDQ3OSIsInByaW5jaXBhbFJvbGUiOiJzYXItcHJvZHVjZXIifSwicmVjb3JkQ2xhc3NpZmljYXRpb24iOiJSRVNUUklDVEVEIn0.gZv_FcGxTOtI2MZM-AAxHAQhl53Gq5hxXZ8sgLvjWEPwMqZmHrU_p9vxvHE_ZwD7aQ01PgctWgP2q6TpkS3YAA"
+  },
+  "classification": "RESTRICTED",
+  "recordClassification": "RESTRICTED"
+}
