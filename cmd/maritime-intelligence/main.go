@@ -19,11 +19,13 @@ import (
 	"github.com/munisp/blueeconomy-maritime-intelligence/internal/geo"
 	"github.com/munisp/blueeconomy-maritime-intelligence/internal/incident"
 	"github.com/munisp/blueeconomy-maritime-intelligence/internal/isr"
-	"github.com/munisp/blueeconomy-maritime-intelligence/internal/provenance"
 	"github.com/munisp/blueeconomy-maritime-intelligence/internal/ledger"
+	"github.com/munisp/blueeconomy-maritime-intelligence/internal/provenance"
+	"github.com/munisp/blueeconomy-maritime-intelligence/internal/sar"
 	"github.com/munisp/blueeconomy-maritime-intelligence/internal/server"
 	"github.com/munisp/blueeconomy-maritime-intelligence/internal/telemetry"
 	"github.com/munisp/blueeconomy-maritime-intelligence/internal/tracks"
+	"github.com/munisp/blueeconomy-maritime-intelligence/internal/yaounde"
 )
 
 func main() {
@@ -207,6 +209,14 @@ func run() error {
 		TrackStore:      trackStore,
 		Fusion:          fusion,
 		FusionErrorHook: telemetryPipeline.RecordFusionIngestError,
+		// Phase 8 modules share the existing provenance signer, pool and
+		// telemetry pipeline (no parallel path).
+		Yaounde:       yaounde.NewStore(store.Pool()).WithSigner(signer).WithTrackSource(server.NewYaoundeTrackSource(fusion)),
+		SAR:           sar.NewStore(store.Pool()).WithSigner(signer),
+		Zones:         fusion.Zones(),
+		SARTracks:     server.NewSARTrackSource(fusion),
+		GeoSOSBaseURL: strings.TrimSpace(os.Getenv("GEO_SERVICE_URL")),
+		GeoSOSToken:   os.Getenv("GEO_SERVICE_TOKEN"),
 	}
 	if outcomeService != nil {
 		outcomeStore, err := ledger.NewOutcomeStore(store.Pool(), outcomeService)
@@ -218,6 +228,7 @@ func run() error {
 	handler := telemetryPipeline.Middleware(server.New(server.Config{
 		Store:         store,
 		ISR:           isrDeps,
+		Telemetry:     telemetryPipeline,
 		Authenticator: authenticator,
 		ReadyzCheck: func(ctx context.Context) error {
 			return store.Pool().Ping(ctx)
