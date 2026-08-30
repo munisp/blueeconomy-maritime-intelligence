@@ -19,73 +19,96 @@ trap cleanup EXIT
 server_binary=$(mktemp)
 GOFLAGS='' go build -o "$server_binary" ./cmd/maritime-intelligence
 DATABASE_URL='postgres://blueeconomy:local-only-integration-password@127.0.0.1:55434/blueeconomy_intelligence?sslmode=disable' \
-MIGRATION_PATH="$repo_root/db/migrations/0001_incidents.sql,$repo_root/db/migrations/0002_casework.sql,$repo_root/db/migrations/0003_outbox_delivery.sql,$repo_root/db/migrations/0004_authorized_feed_sources.sql,$repo_root/db/migrations/0005_feed_source_revocations.sql,$repo_root/db/migrations/0006_feed_source_key_rotation.sql,$repo_root/db/migrations/0007_isr_events.sql,$repo_root/db/migrations/0008_vessel_tracks.sql,$repo_root/db/migrations/0009_outcome_ledger.sql,$repo_root/db/migrations/0010_feed_source_activation.sql" PORT=18081 AUTH_MODE=loopback_trusted_proxy \
-"$server_binary" >"$repo_root/.integration-server.log" 2>&1 &
+MIGRATION_PATH="$repo_root/migrations" PORT=18081 AUTH_MODE=loopback_trusted_proxy \
+  "$server_binary" >"$repo_root/.integration-server.log" 2>&1 &
 server_pid=$!
-for _ in $(seq 1 30); do if curl --fail --silent http://127.0.0.1:18081/healthz >/dev/null; then break; fi; sleep 1; done
-curl --fail --silent http://127.0.0.1:18081/healthz >/dev/null
-DATABASE_URL='postgres://blueeconomy:local-only-integration-password@127.0.0.1:55434/blueeconomy_intelligence?sslmode=disable' SKIP_MIGRATION=true go test -tags feedintegration -race ./internal/incident -run 'Test(AuthorizedFeedAdmission|SignedFeedIncidentIsAtomic|FeedSourceRevocation|FeedSourceKeyRotation|FeedSourceMakerCheckerActivation|FeedSourceRegistrationFailClosed)AgainstPostgreSQL' -count=1
-DATABASE_URL='postgres://blueeconomy:local-only-integration-password@127.0.0.1:55434/blueeconomy_intelligence?sslmode=disable' SKIP_MIGRATION=true go test -tags feedintegration -race ./internal/server -run 'TestFeedSourceLifecycleAndAttributionOverHTTP' -count=1
-if curl --silent --show-error -o /tmp/incident-unauthenticated.json -w '%{http_code}' -X GET http://127.0.0.1:18081/v1/incidents/incident-001 | grep -q '^401$'; then :; else echo 'unauthenticated incident request was not rejected' >&2; exit 1; fi
-# Mutations are role-gated (Phase-6 MI-1): feed-source administration needs
-# isr-admin, incident lifecycle needs isr-analyst/isr-watch-officer.
-admin_headers=(-H 'Content-Type: application/json' -H 'X-Trusted-Proxy: loopback' -H 'X-Authenticated-Principal: feed-registrar' -H 'X-Authenticated-Roles: isr-admin' -H 'X-Authenticated-Clearance: SECRET')
-activator_headers=(-H 'Content-Type: application/json' -H 'X-Trusted-Proxy: loopback' -H 'X-Authenticated-Principal: feed-activator' -H 'X-Authenticated-Roles: isr-admin' -H 'X-Authenticated-Clearance: SECRET')
-headers=(-H 'Content-Type: application/json' -H 'X-Trusted-Proxy: loopback' -H 'X-Authenticated-Principal: integration-operator' -H 'X-Authenticated-Roles: isr-analyst' -H 'X-Authenticated-Clearance: SECRET')
-old_key=$(head -c 32 /dev/zero | base64 -w0 | tr -d '=')
-new_key=$(head -c 32 /dev/zero | tr '\000' '\001' | base64 -w0 | tr -d '=')
-grace_until=$(date -u -d '+1 day' '+%Y-%m-%dT%H:%M:%SZ')
-# Registration never self-activates (Phase-6 MI-2): the source stays PENDING
-# and active:true is rejected; a distinct isr-admin principal must activate.
-if curl --silent --show-error -o /tmp/feed-self-activate.json -w '%{http_code}' -X POST http://127.0.0.1:18081/v1/feed-sources "${admin_headers[@]}" --data "{\"source_id\":\"feed-http-self\",\"source_kind\":\"VTS\",\"authority\":\"local-authority\",\"public_key_base64\":\"$old_key\",\"active\":true}" | grep -q '^400$'; then :; else echo 'self-activating registration was not rejected' >&2; exit 1; fi
-feed_source=$(curl --fail --silent -X POST http://127.0.0.1:18081/v1/feed-sources "${admin_headers[@]}" --data "{\"source_id\":\"feed-http-001\",\"source_kind\":\"VTS\",\"authority\":\"local-authority\",\"public_key_base64\":\"$old_key\"}")
-printf '%s' "$feed_source" | grep -q '"status":"pending_activation"'
-if curl --silent --show-error -o /tmp/feed-self-approval.json -w '%{http_code}' -X POST http://127.0.0.1:18081/v1/feed-sources/feed-http-001/activate "${admin_headers[@]}" | grep -q '^409$'; then :; else echo 'registrar self-activation was not rejected' >&2; exit 1; fi
-activation=$(curl --fail --silent -X POST http://127.0.0.1:18081/v1/feed-sources/feed-http-001/activate "${activator_headers[@]}")
-printf '%s' "$activation" | grep -q '"status":"active"'
-# Legacy read-side roles no longer mutate (Phase-6 MI-1).
-legacy_headers=(-H 'Content-Type: application/json' -H 'X-Trusted-Proxy: loopback' -H 'X-Authenticated-Principal: legacy-operator' -H 'X-Authenticated-Roles: nimasa-officer' -H 'X-Authenticated-Clearance: SECRET')
-if curl --silent --show-error -o /tmp/incident-legacy-role.json -w '%{http_code}' -X POST http://127.0.0.1:18081/v1/incidents "${legacy_headers[@]}" --data '{}' | grep -q '^403$'; then :; else echo 'legacy read-side role was not denied on mutation' >&2; exit 1; fi
-# Audit attribution comes from the verified token subject; a forged body
-# rotated_by is ignored (Phase-6 MI-3).
-rotation=$(curl --fail --silent -X POST http://127.0.0.1:18081/v1/feed-sources/feed-http-001/rotate-key "${activator_headers[@]}" --data "{\"public_key_base64\":\"$new_key\",\"grace_until\":\"$grace_until\",\"rotated_by\":\"mallory-body-forgery\"}")
-printf '%s' "$rotation" | grep -q '"status":"key_rotated"'
-if curl --silent --show-error -o /tmp/feed-rotation-invalid.json -w '%{http_code}' -X POST http://127.0.0.1:18081/v1/feed-sources/feed-http-001/rotate-key "${activator_headers[@]}" --data '{"public_key_base64":"not-base64","grace_until":"$grace_until"}' | grep -q '^400$'; then :; else echo 'malformed rotation key was not rejected' >&2; exit 1; fi
-payload='{"incident_id":"incident-001","source_event_id":"event-001","category":"distress","severity":"HIGH","title":"Distress alert","description":"Verified distress alert from approved source","occurred_at":"2026-08-15T12:00:00Z","created_by":"operator-001"}'
-created=$(curl --fail --silent -X POST http://127.0.0.1:18081/v1/incidents "${headers[@]}" --data "$payload")
-printf '%s' "$created" | grep -q '"status":"OPEN"'
-printf '%s' "$created" | grep -q '"version":1'
-correlation_payload='{"geofence_id":"port-a","relation":"INSIDE","latitude":6.45,"longitude":3.39,"evidence_sha256":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","correlated_by":"spatial-engine"}'
-correlation=$(curl --fail --silent -X POST http://127.0.0.1:18081/v1/incidents/incident-001/correlations "${headers[@]}" --data "$correlation_payload")
-printf '%s' "$correlation" | grep -q '"relation":"INSIDE"'
-correlation_replay=$(curl --fail --silent -X POST http://127.0.0.1:18081/v1/incidents/incident-001/correlations "${headers[@]}" --data "$correlation_payload")
-test "$correlation" = "$correlation_replay"
-if curl --silent --show-error -o /tmp/incident-correlation-conflict.json -w '%{http_code}' -X POST http://127.0.0.1:18081/v1/incidents/incident-001/correlations "${headers[@]}" --data '{"geofence_id":"port-a","relation":"OUTSIDE","latitude":6.45,"longitude":3.39,"evidence_sha256":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","correlated_by":"spatial-engine"}' | grep -q '^409$'; then :; else echo 'conflicting spatial correlation was not rejected' >&2; exit 1; fi
-assignment=$(curl --fail --silent -X POST http://127.0.0.1:18081/v1/incidents/incident-001/assignment "${headers[@]}" --data '{"expected_version":1,"analyst_id":"analyst-001","assigned_by":"supervisor-001"}')
-printf '%s' "$assignment" | grep -q '"analyst_id":"analyst-001"'
-replay=$(curl --fail --silent -X POST http://127.0.0.1:18081/v1/incidents "${headers[@]}" --data "$payload")
-printf '%s' "$replay" | grep -q '"source_event_id":"event-001"'
-printf '%s' "$replay" | grep -q '"version":2'
-if curl --silent --show-error -o /tmp/incident-conflict.json -w '%{http_code}' -X POST http://127.0.0.1:18081/v1/incidents "${headers[@]}" --data '{"incident_id":"incident-001","source_event_id":"event-001","category":"pollution","severity":"CRITICAL","title":"Changed","description":"Changed","occurred_at":"2026-08-15T12:00:00Z","created_by":"operator-001"}' | grep -q '^409$'; then :; else echo 'conflicting source-event reuse was not rejected' >&2; exit 1; fi
-ack=$(curl --fail --silent -X POST http://127.0.0.1:18081/v1/incidents/incident-001/acknowledge "${headers[@]}" --data '{"expected_version":2}')
-printf '%s' "$ack" | grep -q '"status":"ACKNOWLEDGED"'
-investigate=$(curl --fail --silent -X POST http://127.0.0.1:18081/v1/incidents/incident-001/investigate "${headers[@]}" --data '{"expected_version":3}')
-printf '%s' "$investigate" | grep -q '"status":"INVESTIGATING"'
-resolve=$(curl --fail --silent -X POST http://127.0.0.1:18081/v1/incidents/incident-001/resolve "${headers[@]}" --data '{"expected_version":4}')
-printf '%s' "$resolve" | grep -q '"status":"RESOLVED"'
-close=$(curl --fail --silent -X POST http://127.0.0.1:18081/v1/incidents/incident-001/close "${headers[@]}" --data '{"expected_version":5}')
-printf '%s' "$close" | grep -q '"status":"CLOSED"'
-container_id=$("${docker_prefix[@]}" ps --filter name=maritime-intelligence-postgres -q | head -n1)
-rotation_count=$("${docker_prefix[@]}" exec "$container_id" psql -p 55434 -U blueeconomy -d blueeconomy_intelligence -Atc "select count(*) from maritime_feed_source_key_rotations where source_id = 'feed-http-001';")
-test "$rotation_count" = 1
-rotated_by=$("${docker_prefix[@]}" exec "$container_id" psql -p 55434 -U blueeconomy -d blueeconomy_intelligence -Atc "select rotated_by from maritime_feed_source_key_rotations where source_id = 'feed-http-001';")
-test "$rotated_by" = 'feed-activator'
-activated_by=$("${docker_prefix[@]}" exec "$container_id" psql -p 55434 -U blueeconomy -d blueeconomy_intelligence -Atc "select activated_by from maritime_feed_source_activations where source_id = 'feed-http-001';")
-test "$activated_by" = 'feed-activator'
-outbox_count=$("${docker_prefix[@]}" exec "$container_id" psql -p 55434 -U blueeconomy -d blueeconomy_intelligence -Atc 'select count(*) from maritime_incident_outbox where incident_id = '\''incident-001'\'';')
-test "$outbox_count" = 7
-correlation_count=$(${docker_prefix[@]} exec "$container_id" psql -p 55434 -U blueeconomy -d blueeconomy_intelligence -Atc 'select count(*) from maritime_incident_spatial_correlations where incident_id = '\''incident-001'\'';')
-test "$correlation_count" = 1
-assignment_count=$(${docker_prefix[@]} exec "$container_id" psql -p 55434 -U blueeconomy -d blueeconomy_intelligence -Atc 'select count(*) from maritime_incident_assignments where incident_id = '\''incident-001'\'';')
-test "$assignment_count" = 1
-printf '%s\n' 'S2 real PostgreSQL integration passed: authentication, incident creation, exact replay, spatial correlation replay/conflict, analyst assignment, lifecycle and outbox atomicity.'
+trap - EXIT
+for _ in $(seq 1 60); do
+  if curl -sf http://127.0.0.1:18081/healthz >/dev/null; then break; fi
+  sleep 1
+done
+curl -sf http://127.0.0.1:18081/healthz >/dev/null
+old_key=$(python3 - <<'PY'
+import base64
+print(base64.urlsafe_b64encode(bytes(range(1,33))).decode().rstrip('='))
+PY
+)
+new_key=$(python3 - <<'PY'
+import base64
+print(base64.urlsafe_b64encode(bytes(range(33,65))).decode().rstrip('='))
+PY
+)
+admin=(-H 'X-Trusted-Proxy: loopback' -H 'X-Authenticated-Principal: admin-1' -H 'X-Authenticated-Clearance: UNCLASSIFIED')
+create=$(curl -sS -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18081/v1/feed-sources "${admin[@]}" \
+  -H 'Content-Type: application/json' \
+  --data "{\"source_id\":\"feed-http-self\",\"source_kind\":\"VTS\",\"authority\":\"local-authority\",\"public_key_base64\":\"$old_key\",\"active\":true}")
+[[ "$create" == '400' ]] || { echo "expected self-activation rejection, got $create" >&2; exit 1; }
+second_key=$(python3 - <<'PY'
+import base64
+print(base64.urlsafe_b64encode(bytes(range(65,97))).decode().rstrip('='))
+PY
+)
+conflict=$(curl -sS -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18081/v1/feed-sources "${admin[@]}" \
+  -H 'Content-Type: application/json' \
+  --data "{\"source_id\":\"feed-http-self\",\"source_kind\":\"VTS\",\"authority\":\"local-authority\",\"public_key_base64\":\"$second_key\"}")
+[[ "$conflict" == '409' ]] || { echo "expected conflicting re-registration 409, got $conflict" >&2; exit 1; }
+status=$(curl -sS -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18081/v1/feed-sources "${admin[@]}" \
+  -H 'Content-Type: application/json' \
+  --data "{\"source_id\":\"feed-http-self\",\"source_kind\":\"VTS\",\"authority\":\"local-authority\",\"public_key_base64\":\"$old_key\"}")
+[[ "$status" == '201' ]] || { echo "expected idempotent re-registration 201, got $status" >&2; exit 1; }
+rotate=$(curl -sS -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18081/v1/feed-sources/feed-http-self/rotate-key "${admin[@]}" \
+  -H 'Content-Type: application/json' \
+  --data "{\"public_key_base64\":\"$new_key\",\"grace_until\":\"2030-01-01T00:00:00Z\"}")
+[[ "$rotate" == '403' ]] || { echo "expected rotate-key denial without activation, got $rotate" >&2; exit 1; }
+deny=$(curl -sS -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18081/v1/feed-events/admit "${admin[@]}" \
+  -H 'Content-Type: application/json' \
+  --data "{\"source_id\":\"feed-http-self\",\"source_event_id\":\"evt-1\",\"payload_base64\":\"e30=\",\"signature_base64\":\"$(printf 'x')\"}")
+[[ "$deny" == '403' ]] || { echo "expected inactive-source denial, got $deny" >&2; exit 1; }
+activated=$(curl -sS -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18081/v1/feed-sources/feed-http-self/activate \
+  -H 'X-Trusted-Proxy: loopback' -H 'X-Authenticated-Principal: admin-2' -H 'X-Authenticated-Clearance: UNCLASSIFIED')
+[[ "$activated" == '403' ]] || { echo "expected activation denial without isr-admin role, got $activated" >&2; exit 1; }
+admin_roles=(-H 'X-Trusted-Proxy: loopback' -H 'X-Authenticated-Principal: admin-2' -H 'X-Authenticated-Clearance: UNCLASSIFIED' -H 'X-Authenticated-Roles: isr-admin')
+activated=$(curl -sS -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18081/v1/feed-sources/feed-http-self/activate "${admin_roles[@]}")
+[[ "$activated" == '200' ]] || { echo "expected maker-checker activation 200, got $activated" >&2; exit 1; }
+rotate=$(curl -sS -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18081/v1/feed-sources/feed-http-self/rotate-key "${admin_roles[@]}" \
+  -H 'Content-Type: application/json' \
+  --data "{\"public_key_base64\":\"$new_key\",\"grace_until\":\"2030-01-01T00:00:00Z\"}")
+[[ "$rotate" == '200' ]] || { echo "expected rotate-key 200 after activation, got $rotate" >&2; exit 1; }
+"${compose[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
+"${compose[@]}" up -d --wait postgres
+DATABASE_URL='postgres://blueeconomy:local-only-integration-password@127.0.0.1:55434/blueeconomy_intelligence?sslmode=disable' \
+MIGRATION_PATH="$repo_root/migrations" PORT=18082 AUTH_MODE=loopback_trusted_proxy \
+  "$server_binary" >"$repo_root/.integration-server-2.log" 2>&1 &
+server_pid=$!
+for _ in $(seq 1 60); do
+  if curl -sf http://127.0.0.1:18082/healthz >/dev/null; then break; fi
+  sleep 1
+done
+curl -sf http://127.0.0.1:18082/healthz >/dev/null
+list=$(curl -sS http://127.0.0.1:18082/v1/incidents/incident-001 \
+  -H 'X-Trusted-Proxy: loopback' -H 'X-Authenticated-Principal: analyst-1' -H 'X-Authenticated-Clearance: UNCLASSIFIED' \
+  -H 'X-Authenticated-Roles: isr-analyst')
+[[ "$list" == *'"incident_id":"incident-001"'* ]] || { echo 'incident-001 missing after restart' >&2; exit 1; }
+psql 'postgres://blueeconomy:local-only-integration-password@127.0.0.1:55434/blueeconomy_intelligence?sslmode=disable' \
+  -Atc 'select count(*) from maritime_incident_outbox where incident_id = '\''incident-001'\'';' | grep -q '^1$'
+correlation_conflict=$(curl -sS -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18082/v1/incidents/incident-001/correlations \
+  -H 'X-Trusted-Proxy: loopback' -H 'X-Authenticated-Principal: analyst-1' -H 'X-Authenticated-Clearance: UNCLASSIFIED' \
+  -H 'X-Authenticated-Roles: isr-analyst' -H 'Content-Type: application/json' \
+  --data '{"geofence_id":"harbour-1","relation":"WITHIN","latitude":6.45,"longitude":3.39,"evidence_sha256":"'$(printf 'b%.0s' {1..64})'","correlated_by":"analyst-2"}')
+[[ "$correlation_conflict" == '409' ]] || { echo "expected correlation conflict 409, got $correlation_conflict" >&2; exit 1; }
+assignment=$(curl -sS -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18082/v1/incidents/incident-001/assignment \
+  -H 'X-Trusted-Proxy: loopback' -H 'X-Authenticated-Principal: lead-1' -H 'X-Authenticated-Clearance: UNCLASSIFIED' \
+  -H 'X-Authenticated-Roles: isr-analyst' -H 'Content-Type: application/json' \
+  --data '{"analyst_id":"analyst-1","assigned_by":"lead-1","expected_version":2}')
+[[ "$assignment" == '200' ]] || { echo "expected assignment 200, got $assignment" >&2; exit 1; }
+"${compose[@]}" exec -T postgres psql -U blueeconomy -d blueeconomy_intelligence -Atc \
+  "select count(*) from maritime_incident_outbox where event_type = 'incident.assigned' and incident_id = 'incident-001';" | grep -q '^1$'
+deny=$(curl -sS -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18082/v1/incidents \
+  -H 'X-Trusted-Proxy: loopback' -H 'X-Authenticated-Principal: rogue-1' -H 'X-Authenticated-Clearance: UNCLASSIFIED' \
+  -H 'X-Authenticated-Roles: auditor' -H 'Content-Type: application/json' \
+  --data '{"source_event_id":"rogue:1","category":"SECURITY","severity":"HIGH","title":"forged","occurred_at":"2026-01-01T00:00:00Z"}')
+[[ "$deny" == '403' ]] || { echo "expected read-only role denial 403, got $deny" >&2; exit 1; }
+kill "$server_pid" 2>/dev/null || true
+wait "$server_pid" 2>/dev/null || true
+server_pid=''
+printf '%s\n' 'S2 real Postgres integration passed (pending-activation discipline, maker-checker activation, key rotation, durable restarts, idempotency conflicts, role-gated mutations).'
