@@ -30,6 +30,10 @@ func Open(ctx context.Context, databaseURL string) (*Store, error) {
 
 func (store *Store) Close() { store.pool.Close() }
 
+// Pool exposes the underlying pool for bounded sibling stores (isr, tracks,
+// ledger) that share this service's database.
+func (store *Store) Pool() *pgxpool.Pool { return store.pool }
+
 func (store *Store) Exec(ctx context.Context, statement string) error {
 	_, err := store.pool.Exec(ctx, statement)
 	return err
