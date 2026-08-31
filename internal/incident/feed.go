@@ -45,7 +45,8 @@ func (registration FeedSourceRegistration) Validate() error {
 	if !incidentIDPattern.MatchString(registration.SourceID) || !incidentIDPattern.MatchString(registration.Authority) {
 		return errors.New("source_id and authority must be canonical identifiers")
 	}
-	if registration.SourceKind != "AIS" && registration.SourceKind != "VTS" && registration.SourceKind != "RADAR" && registration.SourceKind != "PORT" && registration.SourceKind != "AGENCY" {
+	if registration.SourceKind != "AIS" && registration.SourceKind != "VTS" && registration.SourceKind != "RADAR" && registration.SourceKind != "PORT" && registration.SourceKind != "AGENCY" &&
+		registration.SourceKind != "SAR" && registration.SourceKind != "RF" && registration.SourceKind != "ACOUSTIC" && registration.SourceKind != "OPTICAL" {
 		return errors.New("source_kind is unsupported")
 	}
 	if len(registration.PublicKey) != ed25519.PublicKeySize {
@@ -72,6 +73,12 @@ func feedSigningBytes(sourceID, eventID string, payload []byte) []byte {
 	return []byte(sourceID + "\n" + eventID + "\nsha256:" + hex.EncodeToString(digest[:]))
 }
 
+// FeedSigningBytes is the canonical signing preimage for feed admissions,
+// exported so the ISR admission path verifies the identical signature scheme.
+func FeedSigningBytes(sourceID, eventID string, payload []byte) []byte {
+	return feedSigningBytes(sourceID, eventID, payload)
+}
+
 func (store *Store) RegisterFeedSource(ctx context.Context, registration FeedSourceRegistration) error {
 	if err := registration.Validate(); err != nil {
 		return err
@@ -81,38 +88,28 @@ func (store *Store) RegisterFeedSource(ctx context.Context, registration FeedSou
 	return err
 }
 
+// AdmitFeedEvent records one signed feed event inside a serializable
+// transaction. A replay is accepted only when the retained payload digest and
+// signature match exactly; a source_event_id reused with a conflicting payload
+// or signature fails closed with ErrIdempotencyConflict instead of being
+// silently absorbed by ON CONFLICT DO NOTHING.
 func (store *Store) AdmitFeedEvent(ctx context.Context, request FeedAdmissionRequest) (FeedAdmission, error) {
 	if err := request.Validate(); err != nil {
 		return FeedAdmission{}, err
 	}
-	var publicKey []byte
-	var fingerprint string
-	var active bool
-	err := store.pool.QueryRow(ctx, `SELECT public_key, key_fingerprint, active FROM maritime_feed_sources WHERE source_id=$1`, request.SourceID).Scan(&publicKey, &fingerprint, &active)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return FeedAdmission{}, ErrNotFound
-	}
+	tx, err := store.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {
-		return FeedAdmission{}, fmt.Errorf("load feed source: %w", err)
+		return FeedAdmission{}, fmt.Errorf("begin feed event admission: %w", err)
 	}
-	if !active {
-		return FeedAdmission{}, errors.New("feed source is inactive")
-	}
-	signingBytes := feedSigningBytes(request.SourceID, request.SourceEventID, request.Payload)
-	if !ed25519.Verify(ed25519.PublicKey(publicKey), signingBytes, request.Signature) {
-		var graceKey []byte
-		err = store.pool.QueryRow(ctx, `SELECT prior_public_key FROM maritime_feed_source_key_rotations WHERE source_id=$1 AND grace_until>$2 ORDER BY rotated_at DESC LIMIT 1`, request.SourceID, time.Now().UTC()).Scan(&graceKey)
-		if err != nil || !ed25519.Verify(ed25519.PublicKey(graceKey), signingBytes, request.Signature) {
-			return FeedAdmission{}, errors.New("feed event signature verification failed")
-		}
-	}
-	digest := sha256.Sum256(request.Payload)
-	receivedAt := time.Now().UTC()
-	_, err = store.pool.Exec(ctx, `INSERT INTO maritime_feed_events (source_id, source_event_id, payload_sha256, signature, received_at) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (source_id, source_event_id) DO NOTHING`, request.SourceID, request.SourceEventID, "sha256:"+hex.EncodeToString(digest[:]), request.Signature, receivedAt)
+	defer func() { _ = tx.Rollback(ctx) }()
+	admission, err := admitFeedEventInTransaction(ctx, tx, request)
 	if err != nil {
-		return FeedAdmission{}, fmt.Errorf("record feed event: %w", err)
+		return FeedAdmission{}, err
 	}
-	return FeedAdmission{SourceID: request.SourceID, SourceEventID: request.SourceEventID, PayloadSHA256: "sha256:" + hex.EncodeToString(digest[:]), KeyFingerprint: fingerprint, ReceivedAt: receivedAt}, nil
+	if err := tx.Commit(ctx); err != nil {
+		return FeedAdmission{}, fmt.Errorf("commit feed event admission: %w", err)
+	}
+	return admission, nil
 }
 
 func EncodeFeedSignature(sourceID, eventID string, payload []byte, privateKey ed25519.PrivateKey) string {

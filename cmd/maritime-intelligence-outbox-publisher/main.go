@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/munisp/blueeconomy-maritime-intelligence/internal/incident"
+	"github.com/munisp/blueeconomy-maritime-intelligence/internal/isr"
 	"github.com/segmentio/kafka-go"
 )
 
@@ -19,6 +20,7 @@ type config struct {
 	databaseURL  string
 	brokers      []string
 	topic        string
+	source       string
 	workerID     string
 	lease        time.Duration
 	pollInterval time.Duration
@@ -47,15 +49,72 @@ func run() error {
 	defer store.Close()
 	writer := &kafka.Writer{
 		Addr:         kafka.TCP(cfg.brokers...),
-		Topic:        cfg.topic,
 		Balancer:     &kafka.Hash{},
 		RequiredAcks: kafka.RequireAll,
 		Async:        false,
 	}
 	defer writer.Close()
+	if cfg.source == "isr" {
+		// ISR events carry their topic on the outbox row (maritime.isr.v1,
+		// maritime.behaviour.v1, maritime.outcome.v1).
+		isrPublisher := &isrWorker{store: isr.NewStore(store.Pool()), writer: writer, cfg: cfg}
+		log.Printf("isr outbox publisher %s delivering Workstream F topics via %s", cfg.workerID, strings.Join(cfg.brokers, ","))
+		return isrPublisher.loop(ctx)
+	}
+	writer.Topic = cfg.topic
 	publisher := &worker{store: store, writer: writer, cfg: cfg}
 	log.Printf("outbox publisher %s delivering to Kafka topic %s via %s", cfg.workerID, cfg.topic, strings.Join(cfg.brokers, ","))
 	return publisher.loop(ctx)
+}
+
+type isrWorker struct {
+	store  *isr.Store
+	writer *kafka.Writer
+	cfg    config
+}
+
+func (w *isrWorker) loop(ctx context.Context) error {
+	ticker := time.NewTicker(w.cfg.pollInterval)
+	defer ticker.Stop()
+	for {
+		if err := w.deliverOne(ctx); err != nil && !errors.Is(err, isr.ErrNoPendingISROutbox) {
+			log.Printf("isr outbox delivery: %v", err)
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
+	}
+}
+
+func (w *isrWorker) deliverOne(ctx context.Context) error {
+	event, err := w.store.ClaimISROutbox(ctx, w.cfg.workerID, w.cfg.lease)
+	if err != nil {
+		return err
+	}
+	writeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	err = w.writer.WriteMessages(writeCtx, kafka.Message{
+		Topic: event.Topic,
+		Key:   []byte(event.AggregateKey),
+		Value: event.Payload,
+		Headers: []kafka.Header{
+			{Key: "x-blueeconomy-event-id", Value: []byte(event.EventID.String())},
+			{Key: "x-blueeconomy-event-type", Value: []byte(event.EventType)},
+			{Key: "x-blueeconomy-classification", Value: []byte(event.Classification)},
+			{Key: "x-blueeconomy-envelope-version", Value: []byte(isr.EnvelopeVersion)},
+		},
+	})
+	if err == nil {
+		return w.store.MarkISROutboxPublished(ctx, event.EventID, w.cfg.workerID)
+	}
+	retryAt := time.Now().UTC().Add(backoff(event.Attempts, w.cfg.maxBackoff))
+	markErr := w.store.MarkISROutboxFailed(ctx, event.EventID, w.cfg.workerID, err.Error(), retryAt)
+	if markErr != nil {
+		return fmt.Errorf("Kafka delivery failed: %v; release failed: %w", err, markErr)
+	}
+	return err
 }
 
 type worker struct {
@@ -128,9 +187,19 @@ func loadConfig() (config, error) {
 	if len(brokers) == 0 {
 		return config{}, errors.New("KAFKA_BROKERS must contain at least one broker")
 	}
+	source := strings.TrimSpace(os.Getenv("OUTBOX_SOURCE"))
+	if source == "" {
+		source = "incident"
+	}
+	if source != "incident" && source != "isr" {
+		return config{}, errors.New("OUTBOX_SOURCE must be incident or isr")
+	}
 	topic := os.Getenv("KAFKA_TOPIC")
-	if strings.TrimSpace(topic) == "" || strings.TrimSpace(topic) != topic {
+	if source == "incident" && (strings.TrimSpace(topic) == "" || strings.TrimSpace(topic) != topic) {
 		return config{}, errors.New("KAFKA_TOPIC must be canonical non-empty text")
+	}
+	if source == "isr" && topic != "" {
+		return config{}, errors.New("KAFKA_TOPIC must be unset in isr mode; topics come from outbox rows")
 	}
 	transport := os.Getenv("KAFKA_TRANSPORT")
 	if transport == "" {
@@ -158,7 +227,7 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
-	return config{databaseURL: databaseURL, brokers: brokers, topic: topic, workerID: workerID,
+	return config{databaseURL: databaseURL, brokers: brokers, topic: topic, source: source, workerID: workerID,
 		lease: lease, pollInterval: poll, maxBackoff: maxBackoff, transport: transport}, nil
 }
 

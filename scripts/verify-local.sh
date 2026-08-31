@@ -19,14 +19,14 @@ trap cleanup EXIT
 server_binary=$(mktemp)
 GOFLAGS='' go build -o "$server_binary" ./cmd/maritime-intelligence
 DATABASE_URL='postgres://blueeconomy:local-only-integration-password@127.0.0.1:55434/blueeconomy_intelligence?sslmode=disable' \
-MIGRATION_PATH="$repo_root/db/migrations/0001_incidents.sql,$repo_root/db/migrations/0002_casework.sql,$repo_root/db/migrations/0003_outbox_delivery.sql,$repo_root/db/migrations/0004_authorized_feed_sources.sql,$repo_root/db/migrations/0005_feed_source_revocations.sql,$repo_root/db/migrations/0006_feed_source_key_rotation.sql" PORT=18081 AUTH_MODE=loopback_trusted_proxy \
+MIGRATION_PATH="$repo_root/db/migrations/0001_incidents.sql,$repo_root/db/migrations/0002_casework.sql,$repo_root/db/migrations/0003_outbox_delivery.sql,$repo_root/db/migrations/0004_authorized_feed_sources.sql,$repo_root/db/migrations/0005_feed_source_revocations.sql,$repo_root/db/migrations/0006_feed_source_key_rotation.sql,$repo_root/db/migrations/0007_isr_events.sql,$repo_root/db/migrations/0008_vessel_tracks.sql,$repo_root/db/migrations/0009_outcome_ledger.sql" PORT=18081 AUTH_MODE=loopback_trusted_proxy \
 "$server_binary" >"$repo_root/.integration-server.log" 2>&1 &
 server_pid=$!
 for _ in $(seq 1 30); do if curl --fail --silent http://127.0.0.1:18081/healthz >/dev/null; then break; fi; sleep 1; done
 curl --fail --silent http://127.0.0.1:18081/healthz >/dev/null
 DATABASE_URL='postgres://blueeconomy:local-only-integration-password@127.0.0.1:55434/blueeconomy_intelligence?sslmode=disable' SKIP_MIGRATION=true go test -tags feedintegration -race ./internal/incident -run 'Test(AuthorizedFeedAdmission|SignedFeedIncidentIsAtomic|FeedSourceRevocation|FeedSourceKeyRotation)AgainstPostgreSQL' -count=1
 if curl --silent --show-error -o /tmp/incident-unauthenticated.json -w '%{http_code}' -X GET http://127.0.0.1:18081/v1/incidents/incident-001 | grep -q '^401$'; then :; else echo 'unauthenticated incident request was not rejected' >&2; exit 1; fi
-headers=(-H 'Content-Type: application/json' -H 'X-Trusted-Proxy: loopback' -H 'X-Authenticated-Principal: integration-operator')
+headers=(-H 'Content-Type: application/json' -H 'X-Trusted-Proxy: loopback' -H 'X-Authenticated-Principal: integration-operator' -H 'X-Authenticated-Roles: nimasa-officer' -H 'X-Authenticated-Clearance: SECRET')
 old_key=$(head -c 32 /dev/zero | base64 -w0 | tr -d '=')
 new_key=$(head -c 32 /dev/zero | tr '\000' '\001' | base64 -w0 | tr -d '=')
 grace_until=$(date -u -d '+1 day' '+%Y-%m-%dT%H:%M:%SZ')
