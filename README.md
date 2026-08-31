@@ -73,9 +73,14 @@ with 409.
 `cmd/isr-worker` hosts `ISRResponseWorkflow` on the `TEMPORAL_TASK_QUEUE`
 task queue (fail-closed on `TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`,
 `TEMPORAL_TASK_QUEUE`). The HTTP admission path deliberately stays
-Temporal-free: an external starter (alerting rail, security-operations
-bridge, or operator tooling) starts one workflow instance per admitted
-behaviour anomaly with:
+Temporal-free. `cmd/cv-consumer` is the in-service starter rail: it consumes
+the signed blueeconomy-cv-service topics `cv.dark-vessel.v1` and
+`cv.vessel-detection.v1` (JWS-EdDSA/JCS envelope verification is mandatory —
+rejected records are counted with a reason code and never reach the fusion
+engine), feeds vessel detections into the track-fusion engine, and starts
+one workflow instance per dark-vessel anomaly (workflow ID = anomaly ID,
+idempotent). Other rails (alerting, security-operations bridge, or operator
+tooling) start one workflow instance per admitted behaviour anomaly with:
 
 - **Workflow:** `ISRResponseWorkflow` (registered under that exact name).
 - **Workflow ID:** the anomaly ID (idempotent start per anomaly).
