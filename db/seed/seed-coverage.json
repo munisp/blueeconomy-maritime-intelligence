@@ -1,0 +1,24 @@
+{
+  "database": "be_mintel",
+  "exemptions": {},
+  "table_count": 15,
+  "tables": {
+    "maritime_behaviour_anomalies": 2,
+    "maritime_feed_events": 2,
+    "maritime_feed_source_key_rotations": 2,
+    "maritime_feed_source_revocations": 2,
+    "maritime_feed_sources": 2,
+    "maritime_incident_assignments": 2,
+    "maritime_incident_outbox": 2,
+    "maritime_incident_spatial_correlations": 2,
+    "maritime_incidents": 2,
+    "maritime_isr_events": 2,
+    "maritime_isr_outbox": 2,
+    "maritime_outcome_ledger_entries": 2,
+    "maritime_outcome_ledger_proposals": 2,
+    "maritime_track_associations": 2,
+    "maritime_vessel_tracks": 2
+  },
+  "total_rows": 30,
+  "unjustified_empty_tables": []
+}
