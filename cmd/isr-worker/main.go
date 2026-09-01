@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -134,7 +135,14 @@ func run(logger *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	pool, err := pgxpool.New(ctx, databaseURL)
+	poolConfig, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		return fmt.Errorf("parse postgres dsn: %w", err)
+	}
+	if err := applyPoolEnv(poolConfig); err != nil {
+		return err
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {
 		return fmt.Errorf("open postgres: %w", err)
 	}
@@ -203,4 +211,34 @@ func run(logger *slog.Logger) error {
 		}
 		return nil
 	}
+}
+
+// applyPoolEnv overrides pgx pool sizing from the environment. Unset (or
+// <= 0) values keep the pgx defaults, so behavior is unchanged.
+//
+//	MI_DB_POOL_MAX_CONNS          max open connections (default: pgx default, max(4, NumCPU))
+//	MI_DB_POOL_MIN_CONNS          min idle connections (default: 0)
+//	MI_DB_POOL_MAX_CONN_IDLE_SEC  max connection idle seconds (default: 1800)
+//	MI_DB_POOL_MAX_CONN_LIFE_SEC  max connection lifetime seconds (default: 3600)
+func applyPoolEnv(config *pgxpool.Config) error {
+	for _, knob := range []struct {
+		name string
+		set  func(v int)
+	}{
+		{"MI_DB_POOL_MAX_CONNS", func(v int) { config.MaxConns = int32(v) }},
+		{"MI_DB_POOL_MIN_CONNS", func(v int) { config.MinConns = int32(v) }},
+		{"MI_DB_POOL_MAX_CONN_IDLE_SEC", func(v int) { config.MaxConnIdleTime = time.Duration(v) * time.Second }},
+		{"MI_DB_POOL_MAX_CONN_LIFE_SEC", func(v int) { config.MaxConnLifetime = time.Duration(v) * time.Second }},
+	} {
+		raw := os.Getenv(knob.name)
+		if raw == "" {
+			continue
+		}
+		value, err := strconv.Atoi(raw)
+		if err != nil || value < 0 {
+			return fmt.Errorf("%s must be a non-negative integer, got %q", knob.name, raw)
+		}
+		knob.set(value)
+	}
+	return nil
 }
