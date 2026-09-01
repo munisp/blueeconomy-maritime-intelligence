@@ -316,6 +316,78 @@ func TestDarkVesselScan(t *testing.T) {
 	}
 }
 
+func TestDarkVesselLatchResetsOnAISResumption(t *testing.T) {
+	config := testConfig()
+	config.DarkVesselAISGap = 30 * time.Minute
+	base := time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC)
+	now := base
+	clock := &now
+	engine, err := NewEngine(config, testZones(t), nil, func() time.Time { return *clock }, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mmsi := "636050009"
+	// Episode 1: AIS inside the EEZ, then silence -> exactly one alert.
+	if _, _, err := engine.Ingest(context.Background(), aisDetection(mmsi, base, 6.0, 4.0)); err != nil {
+		t.Fatal(err)
+	}
+	*clock = base.Add(31 * time.Minute)
+	if anomalies := engine.ScanDarkVessels(context.Background()); len(anomalies) != 1 {
+		t.Fatalf("first gap must alert once, got %+v", anomalies)
+	}
+	if anomalies := engine.ScanDarkVessels(context.Background()); len(anomalies) != 0 {
+		t.Fatal("same gap episode must not alert twice")
+	}
+	// The vessel reappears: the AIS gap closes and the latch resets.
+	*clock = base.Add(40 * time.Minute)
+	if _, _, err := engine.Ingest(context.Background(), aisDetection(mmsi, *clock, 6.001, 4.001)); err != nil {
+		t.Fatal(err)
+	}
+	if anomalies := engine.ScanDarkVessels(context.Background()); len(anomalies) != 0 {
+		t.Fatal("no new alert while the vessel is reporting again")
+	}
+	// Episode 2: a later silence must re-alert (the regression was that
+	// the latch never reset, so only one anomaly per track was possible).
+	*clock = base.Add(71 * time.Minute)
+	anomalies := engine.ScanDarkVessels(context.Background())
+	if len(anomalies) != 1 || anomalies[0].Kind != AnomalyDarkVessel {
+		t.Fatalf("second gap must re-alert after AIS resumption: %+v", anomalies)
+	}
+	if anomalies := engine.ScanDarkVessels(context.Background()); len(anomalies) != 0 {
+		t.Fatal("second gap episode must be idempotent too")
+	}
+}
+
+func TestDarkVesselOutOfOrderAISDoesNotRearm(t *testing.T) {
+	config := testConfig()
+	config.DarkVesselAISGap = 30 * time.Minute
+	base := time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC)
+	now := base
+	clock := &now
+	engine, err := NewEngine(config, testZones(t), nil, func() time.Time { return *clock }, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mmsi := "636050010"
+	trackID, _, err := engine.Ingest(context.Background(), aisDetection(mmsi, base, 6.0, 4.0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	*clock = base.Add(31 * time.Minute)
+	if anomalies := engine.ScanDarkVessels(context.Background()); len(anomalies) != 1 {
+		t.Fatal("first gap must alert")
+	}
+	// A stale (older than the latest AIS) replayed report must NOT
+	// re-arm the rule — the gap never actually closed.
+	if err := engine.Replay(trackID, aisDetection(mmsi, base.Add(-5*time.Minute), 6.0, 4.0)); err != nil {
+		t.Fatal(err)
+	}
+	*clock = base.Add(2 * time.Hour)
+	if anomalies := engine.ScanDarkVessels(context.Background()); len(anomalies) != 0 {
+		t.Fatal("out-of-order AIS report must not reset the dark-vessel latch")
+	}
+}
+
 func TestDetectionLatencyRecorded(t *testing.T) {
 	recorder := &recordingLatency{}
 	now := time.Date(2026, 8, 15, 13, 0, 0, 0, time.UTC)

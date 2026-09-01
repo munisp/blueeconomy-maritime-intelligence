@@ -278,6 +278,13 @@ func (engine *Engine) absorbPointLocked(track *Track, detection isr.Detection, p
 	if detection.AIS != nil {
 		point.SpeedKnots = detection.AIS.SpeedKnots
 		point.HeadingDeg = detection.AIS.HeadingDeg
+		if !detection.ObservedAt.Before(track.lastAISAt) {
+			// The newest AIS report closes any open silence episode:
+			// re-arm the dark-vessel rule so a LATER gap alerts again.
+			// The latch still holds within one gap episode (no AIS
+			// arrives during a gap), keeping emission idempotent.
+			track.darkAlerted = false
+		}
 		track.lastAISAt = detection.ObservedAt
 		if track.MMSI == "" {
 			track.MMSI = detection.AIS.MMSI
@@ -509,7 +516,9 @@ func (engine *Engine) evaluateLocked(ctx context.Context, track *Track, point Tr
 // ScanDarkVessels evaluates the dark-vessel rule at scan time: a track with
 // a known MMSI whose most recent point lies inside a coverage (EEZ or
 // restricted) zone and whose last AIS report is older than the configured
-// gap. Returns newly raised anomalies; each track alerts once.
+// gap. Returns newly raised anomalies; each track alerts at most once per
+// silence episode — the latch resets when the vessel's AIS reappears, so a
+// later gap re-alerts.
 func (engine *Engine) ScanDarkVessels(ctx context.Context) []Anomaly {
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
