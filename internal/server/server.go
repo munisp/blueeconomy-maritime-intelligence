@@ -78,10 +78,24 @@ func New(config Config) http.Handler {
 	mux.HandleFunc("GET /healthz", server.health)
 	mux.HandleFunc("GET /readyz", server.readyz)
 	if server.metrics != nil {
-		mux.Handle("GET /metrics", server.metrics)
+		// /metrics exposes operational internals; it is authenticated like
+		// every /v1 route, never anonymous.
+		mux.Handle("GET /metrics", server.requireAuthentication(server.metrics))
 	}
 	mux.Handle("/v1/", server.requireAuthentication(api))
-	return http.MaxBytesHandler(mux, 1<<20)
+	return securityHeaders(http.MaxBytesHandler(mux, 1<<20))
+}
+
+// securityHeaders sets the platform HTTP security headers on every response
+// (HSTS, nosniff, frame deny, no-referrer), including error responses.
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		response.Header().Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
+		response.Header().Set("X-Content-Type-Options", "nosniff")
+		response.Header().Set("X-Frame-Options", "DENY")
+		response.Header().Set("Referrer-Policy", "no-referrer")
+		next.ServeHTTP(response, request)
+	})
 }
 
 type principalContextKey struct{}
