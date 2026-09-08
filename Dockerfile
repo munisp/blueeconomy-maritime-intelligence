@@ -8,5 +8,6 @@ RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o
 
 FROM gcr.io/distroless/base-debian12:nonroot
 COPY --from=build /out/maritime-intelligence /maritime-intelligence
+COPY --from=build /src/db/migrations /db/migrations
 USER nonroot:nonroot
 ENTRYPOINT ["/maritime-intelligence"]
