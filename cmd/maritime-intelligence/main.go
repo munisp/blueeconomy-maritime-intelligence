@@ -148,9 +148,29 @@ func run() error {
 		return err
 	}
 	defer store.Close()
+	// Bookkeeping table + per-file skip: this binary re-applies MIGRATION_PATH
+	// on every boot (there was no journal at all before this), which fails
+	// the moment it runs a second time against an already-migrated database
+	// - confirmed live ("relation already exists") the first time a pod
+	// restarted after a successful first boot. Same pattern used for the
+	// sibling vpp/umoja Postgres migration jobs elsewhere in this platform.
+	if err := store.Exec(ctx, "CREATE TABLE IF NOT EXISTS _migrations_applied (filename TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())"); err != nil {
+		return fmt.Errorf("create migrations bookkeeping table: %w", err)
+	}
 	for index, migration := range migrations {
+		filename := filepath.Base(strings.TrimSpace(migrationPathsList[index]))
+		var alreadyApplied bool
+		if err := store.Pool().QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM _migrations_applied WHERE filename = $1)", filename).Scan(&alreadyApplied); err != nil {
+			return fmt.Errorf("check migration %d (%s) applied: %w", index+1, filename, err)
+		}
+		if alreadyApplied {
+			continue
+		}
 		if err := store.Exec(ctx, string(migration)); err != nil {
-			return fmt.Errorf("apply migration %d: %w", index+1, err)
+			return fmt.Errorf("apply migration %d (%s): %w", index+1, filename, err)
+		}
+		if _, err := store.Pool().Exec(ctx, "INSERT INTO _migrations_applied (filename) VALUES ($1)", filename); err != nil {
+			return fmt.Errorf("record migration %d (%s) applied: %w", index+1, filename, err)
 		}
 	}
 	zones, err := loadFusionZones(os.Getenv("ISR_ZONES_FILE"))
