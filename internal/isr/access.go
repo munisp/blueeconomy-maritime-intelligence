@@ -22,6 +22,11 @@ const (
 	RoleFleetOperator     = "fleet-operator"
 	RoleInsurerAggregator = "insurer-aggregator"
 	RoleAuditor           = "auditor"
+	// RoleFeedSourceAdmin is the dedicated trust-anchor administrator: the
+	// only role allowed to register, revoke or rotate feed-source keys.
+	// Holding any other non-read-only role (e.g. marine-police) is never
+	// sufficient for feed trust-anchor administration.
+	RoleFeedSourceAdmin = "feed-source-admin"
 )
 
 // readOnlyRoles may never perform a mutating call.
@@ -101,6 +106,16 @@ func (principal Principal) CanReadOutcomeAggregates() error {
 		}
 	}
 	return ErrForbidden
+}
+
+// CanAdministerFeedSources enforces the dedicated feed trust-anchor admin
+// role. Any principal without RoleFeedSourceAdmin — including every other
+// non-read-only operational role — is denied.
+func (principal Principal) CanAdministerFeedSources() error {
+	if !principal.HasRole(RoleFeedSourceAdmin) {
+		return ErrForbidden
+	}
+	return nil
 }
 
 // clearanceCeiling returns the highest classification the principal may read;
@@ -223,7 +238,7 @@ func (store *Store) ListAnomalies(ctx context.Context, principal Principal, filt
 	query := `SELECT anomaly_id, kind, classification, track_ids, COALESCE(zone_id,''), detail, correlation_refs, detected_at FROM maritime_behaviour_anomalies WHERE classification = ANY($1)`
 	args := []any{labels}
 	if filter.Kind != "" {
-		args = append(args, filter.Kind)
+		args = append(args, string(filter.Kind))
 		query += fmt.Sprintf(" AND kind = $%d", len(args))
 	}
 	if !filter.Since.IsZero() {

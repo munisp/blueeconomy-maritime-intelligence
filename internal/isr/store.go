@@ -38,10 +38,11 @@ func NewStore(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
 // SignedDetectionRequest is one signature-verified multi-modal detection
 // admission. Payload is the canonical JSON encoding of Detection.
 type SignedDetectionRequest struct {
-	SourceID      string `json:"source_id"`
-	SourceEventID string `json:"source_event_id"`
-	Payload       []byte `json:"payload"`
-	Signature     []byte `json:"signature"`
+	SourceID      string    `json:"source_id"`
+	SourceEventID string    `json:"source_event_id"`
+	ClaimedAt     time.Time `json:"claimed_at"`
+	Payload       []byte    `json:"payload"`
+	Signature     []byte    `json:"signature"`
 }
 
 // DetectionAdmission is the retained admission evidence for one detection.
@@ -63,6 +64,9 @@ func (request SignedDetectionRequest) validateEnvelope() error {
 	}
 	if len(request.Signature) != ed25519.SignatureSize {
 		return errors.New("ed25519 signature is required")
+	}
+	if request.ClaimedAt.IsZero() {
+		return errors.New("claimed_at must be an RFC3339 timestamp inside the signed preimage")
 	}
 	return nil
 }
@@ -118,7 +122,10 @@ func (store *Store) AdmitDetection(ctx context.Context, request SignedDetectionR
 	if !active {
 		return Detection{}, DetectionAdmission{}, errors.New("feed source is inactive")
 	}
-	signingBytes := incident.FeedSigningBytes(request.SourceID, request.SourceEventID, request.Payload)
+	if err := incident.ValidateFeedFreshness(request.ClaimedAt, time.Now().UTC()); err != nil {
+		return Detection{}, DetectionAdmission{}, err
+	}
+	signingBytes := incident.FeedSigningBytes(request.SourceID, request.SourceEventID, request.ClaimedAt, request.Payload)
 	if !ed25519.Verify(ed25519.PublicKey(publicKey), signingBytes, request.Signature) {
 		var graceKey []byte
 		err := tx.QueryRow(ctx, `SELECT prior_public_key FROM maritime_feed_source_key_rotations WHERE source_id=$1 AND grace_until>$2 ORDER BY rotated_at DESC LIMIT 1`, request.SourceID, time.Now().UTC()).Scan(&graceKey)
