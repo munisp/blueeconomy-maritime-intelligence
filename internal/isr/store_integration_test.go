@@ -51,9 +51,10 @@ func signedDetection(t *testing.T, privateKey ed25519.PrivateKey, sourceID, even
 	if err != nil {
 		t.Fatal(err)
 	}
+	claimedAt := time.Now().UTC()
 	return SignedDetectionRequest{
-		SourceID: sourceID, SourceEventID: eventID, Payload: payload,
-		Signature: ed25519.Sign(privateKey, incident.FeedSigningBytes(sourceID, eventID, payload)),
+		SourceID: sourceID, SourceEventID: eventID, ClaimedAt: claimedAt, Payload: payload,
+		Signature: ed25519.Sign(privateKey, incident.FeedSigningBytes(sourceID, eventID, claimedAt, payload)),
 	}
 }
 

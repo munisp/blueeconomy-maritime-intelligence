@@ -33,10 +33,11 @@ func (server *Server) admitDetection(response http.ResponseWriter, request *http
 		return
 	}
 	var input struct {
-		SourceID        string `json:"source_id"`
-		SourceEventID   string `json:"source_event_id"`
-		PayloadBase64   string `json:"payload_base64"`
-		SignatureBase64 string `json:"signature_base64"`
+		SourceID        string    `json:"source_id"`
+		SourceEventID   string    `json:"source_event_id"`
+		ClaimedAt       time.Time `json:"claimed_at"`
+		PayloadBase64   string    `json:"payload_base64"`
+		SignatureBase64 string    `json:"signature_base64"`
 	}
 	decoder := json.NewDecoder(request.Body)
 	decoder.DisallowUnknownFields()
@@ -55,7 +56,7 @@ func (server *Server) admitDetection(response http.ResponseWriter, request *http
 		return
 	}
 	detection, admission, err := server.isr.ISRStore.AdmitDetection(request.Context(), isr.SignedDetectionRequest{
-		SourceID: input.SourceID, SourceEventID: input.SourceEventID, Payload: payload, Signature: signature,
+		SourceID: input.SourceID, SourceEventID: input.SourceEventID, ClaimedAt: input.ClaimedAt, Payload: payload, Signature: signature,
 	})
 	if err != nil {
 		writeISRError(response, err)

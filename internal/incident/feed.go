@@ -26,11 +26,22 @@ type FeedSourceRegistration struct {
 	Active     bool              `json:"active"`
 }
 
+// Feed replay discipline (M8): every signed feed admission carries a
+// claimed_at timestamp inside the signing preimage. Admissions older than
+// FeedReplayWindow or further than FeedClockSkew in the future are rejected
+// fail-closed, so a captured (source, event, payload, signature) tuple is
+// replayable only inside the window rather than forever.
+const (
+	FeedReplayWindow = 24 * time.Hour
+	FeedClockSkew    = 5 * time.Minute
+)
+
 type FeedAdmissionRequest struct {
-	SourceID      string `json:"source_id"`
-	SourceEventID string `json:"source_event_id"`
-	Payload       []byte `json:"payload"`
-	Signature     []byte `json:"signature"`
+	SourceID      string    `json:"source_id"`
+	SourceEventID string    `json:"source_event_id"`
+	ClaimedAt     time.Time `json:"claimed_at"`
+	Payload       []byte    `json:"payload"`
+	Signature     []byte    `json:"signature"`
 }
 
 type FeedAdmission struct {
@@ -65,27 +76,83 @@ func (request FeedAdmissionRequest) Validate() error {
 	if len(request.Signature) != ed25519.SignatureSize {
 		return errors.New("ed25519 signature is required")
 	}
+	if request.ClaimedAt.IsZero() {
+		return errors.New("claimed_at must be an RFC3339 timestamp inside the signed preimage")
+	}
 	return nil
 }
 
-func feedSigningBytes(sourceID, eventID string, payload []byte) []byte {
+// ValidateFeedFreshness enforces the replay window on the signed claimed_at
+// timestamp: too-old admissions are stale replays, too-far-future claims
+// indicate a broken or malicious source clock.
+func ValidateFeedFreshness(claimedAt, now time.Time) error {
+	if claimedAt.IsZero() {
+		return errors.New("claimed_at is required")
+	}
+	if claimedAt.Before(now.Add(-FeedReplayWindow)) {
+		return errors.New("feed event claimed_at is outside the replay window")
+	}
+	if claimedAt.After(now.Add(FeedClockSkew)) {
+		return errors.New("feed event claimed_at is beyond the allowed clock skew")
+	}
+	return nil
+}
+
+func feedSigningBytes(sourceID, eventID string, claimedAt time.Time, payload []byte) []byte {
 	digest := sha256.Sum256(payload)
-	return []byte(sourceID + "\n" + eventID + "\nsha256:" + hex.EncodeToString(digest[:]))
+	return []byte(sourceID + "\n" + eventID + "\n" + claimedAt.UTC().Format(time.RFC3339Nano) + "\nsha256:" + hex.EncodeToString(digest[:]))
 }
 
 // FeedSigningBytes is the canonical signing preimage for feed admissions,
 // exported so the ISR admission path verifies the identical signature scheme.
-func FeedSigningBytes(sourceID, eventID string, payload []byte) []byte {
-	return feedSigningBytes(sourceID, eventID, payload)
+// The claimed_at timestamp is part of the preimage (M8).
+func FeedSigningBytes(sourceID, eventID string, claimedAt time.Time, payload []byte) []byte {
+	return feedSigningBytes(sourceID, eventID, claimedAt, payload)
 }
 
+// ErrFeedSourceKeyConflict rejects any registration that would overwrite the
+// verification key of an existing feed source. Key replacement must go
+// through the explicit rotate-key ceremony (RotateFeedSourceKey), which
+// records the prior key with a bounded grace window.
+var ErrFeedSourceKeyConflict = errors.New("feed source key change requires the explicit rotate-key ceremony")
+
+// RegisterFeedSource registers a new feed trust anchor. It never overwrites
+// an existing source's key: an idempotent replay of the identical
+// registration is absorbed, a metadata-only refresh (same key) is applied,
+// and any key change fails closed with ErrFeedSourceKeyConflict (C1).
 func (store *Store) RegisterFeedSource(ctx context.Context, registration FeedSourceRegistration) error {
 	if err := registration.Validate(); err != nil {
 		return err
 	}
 	digest := sha256.Sum256(registration.PublicKey)
-	_, err := store.pool.Exec(ctx, `INSERT INTO maritime_feed_sources (source_id, source_kind, authority, public_key, key_fingerprint, active, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$7) ON CONFLICT (source_id) DO UPDATE SET source_kind=EXCLUDED.source_kind, authority=EXCLUDED.authority, public_key=EXCLUDED.public_key, key_fingerprint=EXCLUDED.key_fingerprint, active=EXCLUDED.active, updated_at=EXCLUDED.updated_at`, registration.SourceID, registration.SourceKind, registration.Authority, []byte(registration.PublicKey), "sha256:"+hex.EncodeToString(digest[:]), registration.Active, time.Now().UTC())
-	return err
+	fingerprint := "sha256:" + hex.EncodeToString(digest[:])
+	tx, err := store.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		return fmt.Errorf("begin feed source registration: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var retainedKey []byte
+	var retainedKind, retainedAuthority string
+	var retainedActive bool
+	err = tx.QueryRow(ctx, `SELECT public_key, source_kind, authority, active FROM maritime_feed_sources WHERE source_id=$1 FOR UPDATE`, registration.SourceID).Scan(&retainedKey, &retainedKind, &retainedAuthority, &retainedActive)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		if _, err := tx.Exec(ctx, `INSERT INTO maritime_feed_sources (source_id, source_kind, authority, public_key, key_fingerprint, active, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$7)`, registration.SourceID, registration.SourceKind, registration.Authority, []byte(registration.PublicKey), fingerprint, registration.Active, time.Now().UTC()); err != nil {
+			return fmt.Errorf("register feed source: %w", err)
+		}
+	case err != nil:
+		return fmt.Errorf("load feed source: %w", err)
+	default:
+		if !bytes.Equal(retainedKey, []byte(registration.PublicKey)) {
+			return ErrFeedSourceKeyConflict
+		}
+		if retainedKind != registration.SourceKind || retainedAuthority != registration.Authority || retainedActive != registration.Active {
+			if _, err := tx.Exec(ctx, `UPDATE maritime_feed_sources SET source_kind=$2, authority=$3, active=$4, updated_at=$5 WHERE source_id=$1`, registration.SourceID, registration.SourceKind, registration.Authority, registration.Active, time.Now().UTC()); err != nil {
+				return fmt.Errorf("refresh feed source metadata: %w", err)
+			}
+		}
+	}
+	return tx.Commit(ctx)
 }
 
 // AdmitFeedEvent records one signed feed event inside a serializable
@@ -112,8 +179,8 @@ func (store *Store) AdmitFeedEvent(ctx context.Context, request FeedAdmissionReq
 	return admission, nil
 }
 
-func EncodeFeedSignature(sourceID, eventID string, payload []byte, privateKey ed25519.PrivateKey) string {
-	return base64.RawStdEncoding.EncodeToString(ed25519.Sign(privateKey, feedSigningBytes(sourceID, eventID, payload)))
+func EncodeFeedSignature(sourceID, eventID string, claimedAt time.Time, payload []byte, privateKey ed25519.PrivateKey) string {
+	return base64.RawStdEncoding.EncodeToString(ed25519.Sign(privateKey, feedSigningBytes(sourceID, eventID, claimedAt, payload)))
 }
 
 func DecodeFeedSignature(value string) ([]byte, error) {
@@ -198,7 +265,10 @@ func admitFeedEventInTransaction(ctx context.Context, tx pgx.Tx, request FeedAdm
 	if !active {
 		return FeedAdmission{}, errors.New("feed source is inactive")
 	}
-	signingBytes := feedSigningBytes(request.SourceID, request.SourceEventID, request.Payload)
+	if err := ValidateFeedFreshness(request.ClaimedAt, time.Now().UTC()); err != nil {
+		return FeedAdmission{}, err
+	}
+	signingBytes := feedSigningBytes(request.SourceID, request.SourceEventID, request.ClaimedAt, request.Payload)
 	if !ed25519.Verify(ed25519.PublicKey(publicKey), signingBytes, request.Signature) {
 		var graceKey []byte
 		err := tx.QueryRow(ctx, `SELECT prior_public_key FROM maritime_feed_source_key_rotations WHERE source_id=$1 AND grace_until>$2 ORDER BY rotated_at DESC LIMIT 1`, request.SourceID, time.Now().UTC()).Scan(&graceKey)
