@@ -27,6 +27,7 @@ func TestSignedFeedIncidentIsAtomicAgainstPostgreSQL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	claimedAt := time.Now().UTC()
 	sourceID := "radar-feed-incident"
 	if err := store.RegisterFeedSource(ctx, FeedSourceRegistration{SourceID: sourceID, SourceKind: "RADAR", Authority: "local-authority", PublicKey: publicKey, Active: true}); err != nil {
 		t.Fatal(err)
@@ -37,15 +38,15 @@ func TestSignedFeedIncidentIsAtomicAgainstPostgreSQL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	signature := ed25519.Sign(privateKey, feedSigningBytes(sourceID, eventID, payload))
-	result, err := store.AdmitFeedIncident(ctx, SignedFeedIncidentRequest{FeedAdmissionRequest: FeedAdmissionRequest{SourceID: sourceID, SourceEventID: eventID, Payload: payload, Signature: signature}})
+	signature := ed25519.Sign(privateKey, feedSigningBytes(sourceID, eventID, claimedAt, payload))
+	result, err := store.AdmitFeedIncident(ctx, SignedFeedIncidentRequest{FeedAdmissionRequest: FeedAdmissionRequest{SourceID: sourceID, SourceEventID: eventID, ClaimedAt: claimedAt, Payload: payload, Signature: signature}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if result.Incident.IncidentID != create.IncidentID || result.Admission.SourceEventID != eventID {
 		t.Fatalf("unexpected feed incident result: %+v", result)
 	}
-	if _, err := store.AdmitFeedIncident(ctx, SignedFeedIncidentRequest{FeedAdmissionRequest: FeedAdmissionRequest{SourceID: sourceID, SourceEventID: eventID, Payload: payload, Signature: signature}}); err != nil {
+	if _, err := store.AdmitFeedIncident(ctx, SignedFeedIncidentRequest{FeedAdmissionRequest: FeedAdmissionRequest{SourceID: sourceID, SourceEventID: eventID, ClaimedAt: claimedAt, Payload: payload, Signature: signature}}); err != nil {
 		t.Fatalf("exact replay failed: %v", err)
 	}
 	var outboxCount int
@@ -63,8 +64,8 @@ func TestSignedFeedIncidentIsAtomicAgainstPostgreSQL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	invalidSignature := ed25519.Sign(privateKey, feedSigningBytes(sourceID, invalidEventID, invalidPayload))
-	if _, err := store.AdmitFeedIncident(ctx, SignedFeedIncidentRequest{FeedAdmissionRequest: FeedAdmissionRequest{SourceID: sourceID, SourceEventID: invalidEventID, Payload: invalidPayload, Signature: invalidSignature}}); err == nil {
+	invalidSignature := ed25519.Sign(privateKey, feedSigningBytes(sourceID, invalidEventID, claimedAt, invalidPayload))
+	if _, err := store.AdmitFeedIncident(ctx, SignedFeedIncidentRequest{FeedAdmissionRequest: FeedAdmissionRequest{SourceID: sourceID, SourceEventID: invalidEventID, ClaimedAt: claimedAt, Payload: invalidPayload, Signature: invalidSignature}}); err == nil {
 		t.Fatal("unbound signed incident payload was accepted")
 	}
 	var retainedFeedCount int
@@ -99,34 +100,35 @@ func TestAuthorizedFeedAdmissionAgainstPostgreSQL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	claimedAt := time.Now().UTC()
 	sourceID := "ais-local-integration"
 	if err := store.RegisterFeedSource(ctx, FeedSourceRegistration{SourceID: sourceID, SourceKind: "AIS", Authority: "local-authority", PublicKey: publicKey, Active: true}); err != nil {
 		t.Fatal(err)
 	}
 	payload := []byte(`{"mmsi":"636019999","lat":6.45,"lon":3.39}`)
 	eventID := "ais-event-integration-001"
-	signature := ed25519.Sign(privateKey, feedSigningBytes(sourceID, eventID, payload))
-	admitted, err := store.AdmitFeedEvent(ctx, FeedAdmissionRequest{SourceID: sourceID, SourceEventID: eventID, Payload: payload, Signature: signature})
+	signature := ed25519.Sign(privateKey, feedSigningBytes(sourceID, eventID, claimedAt, payload))
+	admitted, err := store.AdmitFeedEvent(ctx, FeedAdmissionRequest{SourceID: sourceID, SourceEventID: eventID, ClaimedAt: claimedAt, Payload: payload, Signature: signature})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if admitted.PayloadSHA256 == "" || admitted.KeyFingerprint == "" {
 		t.Fatal("missing feed evidence")
 	}
-	if _, err := store.AdmitFeedEvent(ctx, FeedAdmissionRequest{SourceID: sourceID, SourceEventID: eventID, Payload: payload, Signature: signature}); err != nil {
+	if _, err := store.AdmitFeedEvent(ctx, FeedAdmissionRequest{SourceID: sourceID, SourceEventID: eventID, ClaimedAt: claimedAt, Payload: payload, Signature: signature}); err != nil {
 		t.Fatal(err)
 	}
 	bad := append([]byte(nil), signature...)
 	bad[0] ^= 0xff
-	if _, err := store.AdmitFeedEvent(ctx, FeedAdmissionRequest{SourceID: sourceID, SourceEventID: "ais-event-integration-002", Payload: payload, Signature: bad}); err == nil {
+	if _, err := store.AdmitFeedEvent(ctx, FeedAdmissionRequest{SourceID: sourceID, SourceEventID: "ais-event-integration-002", ClaimedAt: claimedAt, Payload: payload, Signature: bad}); err == nil {
 		t.Fatal("invalid signature was accepted")
 	}
 	// Conflicting replay: same source_event_id with a different, validly
 	// signed payload must fail closed with ErrIdempotencyConflict, not be
 	// silently absorbed.
 	conflictingPayload := []byte(`{"mmsi":"636019999","lat":7.45,"lon":4.39}`)
-	conflictingSignature := ed25519.Sign(privateKey, feedSigningBytes(sourceID, eventID, conflictingPayload))
-	if _, err := store.AdmitFeedEvent(ctx, FeedAdmissionRequest{SourceID: sourceID, SourceEventID: eventID, Payload: conflictingPayload, Signature: conflictingSignature}); !errors.Is(err, ErrIdempotencyConflict) {
+	conflictingSignature := ed25519.Sign(privateKey, feedSigningBytes(sourceID, eventID, claimedAt, conflictingPayload))
+	if _, err := store.AdmitFeedEvent(ctx, FeedAdmissionRequest{SourceID: sourceID, SourceEventID: eventID, ClaimedAt: claimedAt, Payload: conflictingPayload, Signature: conflictingSignature}); !errors.Is(err, ErrIdempotencyConflict) {
 		t.Fatalf("conflicting replay must fail with ErrIdempotencyConflict, got %v", err)
 	}
 }
@@ -143,6 +145,7 @@ func TestFeedSourceRevocationAgainstPostgreSQL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	claimedAt := time.Now().UTC()
 	sourceID := "revocable-feed-integration"
 	if err := store.RegisterFeedSource(ctx, FeedSourceRegistration{SourceID: sourceID, SourceKind: "AIS", Authority: "local-authority", PublicKey: publicKey, Active: true}); err != nil {
 		t.Fatal(err)
@@ -158,8 +161,8 @@ func TestFeedSourceRevocationAgainstPostgreSQL(t *testing.T) {
 		t.Fatalf("conflicting revocation error = %v", err)
 	}
 	payload := []byte(`{"mmsi":"636019999"}`)
-	signature := ed25519.Sign(privateKey, feedSigningBytes(sourceID, "post-revocation-event", payload))
-	if _, err := store.AdmitFeedEvent(ctx, FeedAdmissionRequest{SourceID: sourceID, SourceEventID: "post-revocation-event", Payload: payload, Signature: signature}); err == nil {
+	signature := ed25519.Sign(privateKey, feedSigningBytes(sourceID, "post-revocation-event", claimedAt, payload))
+	if _, err := store.AdmitFeedEvent(ctx, FeedAdmissionRequest{SourceID: sourceID, SourceEventID: "post-revocation-event", ClaimedAt: claimedAt, Payload: payload, Signature: signature}); err == nil {
 		t.Fatal("revoked source admitted signed event")
 	}
 	var active bool
@@ -183,6 +186,7 @@ func TestFeedSourceKeyRotationAgainstPostgreSQL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	claimedAt := time.Now().UTC()
 	newPublic, newPrivate, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -195,19 +199,19 @@ func TestFeedSourceKeyRotationAgainstPostgreSQL(t *testing.T) {
 		t.Fatal(err)
 	}
 	payload := []byte(`{"vessel":"test"}`)
-	oldSignature := ed25519.Sign(oldPrivate, feedSigningBytes(sourceID, "rotation-grace-event", payload))
-	if _, err := store.AdmitFeedEvent(ctx, FeedAdmissionRequest{SourceID: sourceID, SourceEventID: "rotation-grace-event", Payload: payload, Signature: oldSignature}); err != nil {
+	oldSignature := ed25519.Sign(oldPrivate, feedSigningBytes(sourceID, "rotation-grace-event", claimedAt, payload))
+	if _, err := store.AdmitFeedEvent(ctx, FeedAdmissionRequest{SourceID: sourceID, SourceEventID: "rotation-grace-event", ClaimedAt: claimedAt, Payload: payload, Signature: oldSignature}); err != nil {
 		t.Fatalf("prior key rejected within grace window: %v", err)
 	}
-	newSignature := ed25519.Sign(newPrivate, feedSigningBytes(sourceID, "rotation-new-key-event", payload))
-	if _, err := store.AdmitFeedEvent(ctx, FeedAdmissionRequest{SourceID: sourceID, SourceEventID: "rotation-new-key-event", Payload: payload, Signature: newSignature}); err != nil {
+	newSignature := ed25519.Sign(newPrivate, feedSigningBytes(sourceID, "rotation-new-key-event", claimedAt, payload))
+	if _, err := store.AdmitFeedEvent(ctx, FeedAdmissionRequest{SourceID: sourceID, SourceEventID: "rotation-new-key-event", ClaimedAt: claimedAt, Payload: payload, Signature: newSignature}); err != nil {
 		t.Fatalf("replacement key rejected: %v", err)
 	}
 	if _, err := store.pool.Exec(ctx, `UPDATE maritime_feed_source_key_rotations SET grace_until=$2 WHERE source_id=$1`, sourceID, time.Now().UTC().Add(-time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	expiredSignature := ed25519.Sign(oldPrivate, feedSigningBytes(sourceID, "rotation-expired-event", payload))
-	if _, err := store.AdmitFeedEvent(ctx, FeedAdmissionRequest{SourceID: sourceID, SourceEventID: "rotation-expired-event", Payload: payload, Signature: expiredSignature}); err == nil {
+	expiredSignature := ed25519.Sign(oldPrivate, feedSigningBytes(sourceID, "rotation-expired-event", claimedAt, payload))
+	if _, err := store.AdmitFeedEvent(ctx, FeedAdmissionRequest{SourceID: sourceID, SourceEventID: "rotation-expired-event", ClaimedAt: claimedAt, Payload: payload, Signature: expiredSignature}); err == nil {
 		t.Fatal("expired prior key was accepted")
 	}
 }
