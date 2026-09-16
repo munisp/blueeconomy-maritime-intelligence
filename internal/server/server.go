@@ -57,9 +57,12 @@ func New(config Config) http.Handler {
 	server := &Server{store: config.Store, isr: config.ISR, authenticator: config.Authenticator, readyzCheck: config.ReadyzCheck, metrics: config.Metrics, logger: logger}
 	api := http.NewServeMux()
 	api.HandleFunc("POST /v1/incidents", server.create)
-	api.HandleFunc("POST /v1/feed-sources", server.registerFeedSource)
-	api.HandleFunc("POST /v1/feed-sources/{sourceID}/revoke", server.revokeFeedSource)
-	api.HandleFunc("POST /v1/feed-sources/{sourceID}/rotate-key", server.rotateFeedSourceKey)
+	// Feed trust-anchor administration is restricted to the dedicated
+	// feed-source-admin role (C1): any other non-read-only principal must
+	// never register, revoke or rotate feed-source keys.
+	api.HandleFunc("POST /v1/feed-sources", server.requireFeedSourceAdmin(server.registerFeedSource))
+	api.HandleFunc("POST /v1/feed-sources/{sourceID}/revoke", server.requireFeedSourceAdmin(server.revokeFeedSource))
+	api.HandleFunc("POST /v1/feed-sources/{sourceID}/rotate-key", server.requireFeedSourceAdmin(server.rotateFeedSourceKey))
 	api.HandleFunc("POST /v1/feed-events/admit", server.admitFeedEvent)
 	api.HandleFunc("POST /v1/feed-events/admit-incident", server.admitFeedIncident)
 	api.HandleFunc("GET /v1/incidents/", server.get)
@@ -143,6 +146,23 @@ func (server *Server) readyz(response http.ResponseWriter, request *http.Request
 	writeJSON(response, http.StatusOK, map[string]string{"status": "ready"})
 }
 
+// requireFeedSourceAdmin gates feed trust-anchor administration on the
+// dedicated feed-source-admin role held by the authenticated principal.
+func (server *Server) requireFeedSourceAdmin(next http.HandlerFunc) http.HandlerFunc {
+	return func(response http.ResponseWriter, request *http.Request) {
+		principal, ok := principalFrom(request)
+		if !ok {
+			writeError(response, http.StatusUnauthorized, "authentication failed")
+			return
+		}
+		if err := principal.CanAdministerFeedSources(); err != nil {
+			writeError(response, http.StatusForbidden, "feed-source administration requires the feed-source-admin role")
+			return
+		}
+		next(response, request)
+	}
+}
+
 func (server *Server) registerFeedSource(response http.ResponseWriter, request *http.Request) {
 	var input struct {
 		SourceID        string `json:"source_id"`
@@ -180,7 +200,11 @@ func (server *Server) revokeFeedSource(response http.ResponseWriter, request *ht
 		writeError(response, http.StatusBadRequest, "invalid feed source revocation JSON")
 		return
 	}
-	if err := server.store.RevokeFeedSource(request.Context(), incident.FeedSourceRevocation{SourceID: request.PathValue("sourceID"), Reason: input.Reason, RevokedBy: input.RevokedBy}); err != nil {
+	// revoked_by is bound to the authenticated principal, never the request
+	// body (C1): a client-supplied revoked_by is accepted for compatibility
+	// but always discarded.
+	principal, _ := principalFrom(request)
+	if err := server.store.RevokeFeedSource(request.Context(), incident.FeedSourceRevocation{SourceID: request.PathValue("sourceID"), Reason: input.Reason, RevokedBy: principal.Subject}); err != nil {
 		writeIncidentError(response, err)
 		return
 	}
@@ -204,7 +228,10 @@ func (server *Server) rotateFeedSourceKey(response http.ResponseWriter, request 
 		writeError(response, http.StatusBadRequest, "public_key_base64 is invalid")
 		return
 	}
-	if err := server.store.RotateFeedSourceKey(request.Context(), incident.FeedSourceKeyRotation{SourceID: request.PathValue("sourceID"), NewPublicKey: key, GraceUntil: input.GraceUntil, RotatedBy: input.RotatedBy}); err != nil {
+	// rotated_by is bound to the authenticated principal, never the request
+	// body (C1); a client-supplied rotated_by is always discarded.
+	principal, _ := principalFrom(request)
+	if err := server.store.RotateFeedSourceKey(request.Context(), incident.FeedSourceKeyRotation{SourceID: request.PathValue("sourceID"), NewPublicKey: key, GraceUntil: input.GraceUntil, RotatedBy: principal.Subject}); err != nil {
 		writeIncidentError(response, err)
 		return
 	}
@@ -213,10 +240,11 @@ func (server *Server) rotateFeedSourceKey(response http.ResponseWriter, request 
 
 func (server *Server) admitFeedEvent(response http.ResponseWriter, request *http.Request) {
 	var input struct {
-		SourceID        string `json:"source_id"`
-		SourceEventID   string `json:"source_event_id"`
-		PayloadBase64   string `json:"payload_base64"`
-		SignatureBase64 string `json:"signature_base64"`
+		SourceID        string    `json:"source_id"`
+		SourceEventID   string    `json:"source_event_id"`
+		ClaimedAt       time.Time `json:"claimed_at"`
+		PayloadBase64   string    `json:"payload_base64"`
+		SignatureBase64 string    `json:"signature_base64"`
 	}
 	decoder := json.NewDecoder(request.Body)
 	decoder.DisallowUnknownFields()
@@ -234,7 +262,7 @@ func (server *Server) admitFeedEvent(response http.ResponseWriter, request *http
 		writeError(response, http.StatusBadRequest, "signature_base64 is invalid")
 		return
 	}
-	admission, err := server.store.AdmitFeedEvent(request.Context(), incident.FeedAdmissionRequest{SourceID: input.SourceID, SourceEventID: input.SourceEventID, Payload: payload, Signature: signature})
+	admission, err := server.store.AdmitFeedEvent(request.Context(), incident.FeedAdmissionRequest{SourceID: input.SourceID, SourceEventID: input.SourceEventID, ClaimedAt: input.ClaimedAt, Payload: payload, Signature: signature})
 	if err != nil {
 		writeIncidentError(response, err)
 		return
@@ -244,10 +272,11 @@ func (server *Server) admitFeedEvent(response http.ResponseWriter, request *http
 
 func (server *Server) admitFeedIncident(response http.ResponseWriter, request *http.Request) {
 	var input struct {
-		SourceID        string `json:"source_id"`
-		SourceEventID   string `json:"source_event_id"`
-		PayloadBase64   string `json:"payload_base64"`
-		SignatureBase64 string `json:"signature_base64"`
+		SourceID        string    `json:"source_id"`
+		SourceEventID   string    `json:"source_event_id"`
+		ClaimedAt       time.Time `json:"claimed_at"`
+		PayloadBase64   string    `json:"payload_base64"`
+		SignatureBase64 string    `json:"signature_base64"`
 	}
 	decoder := json.NewDecoder(request.Body)
 	decoder.DisallowUnknownFields()
@@ -265,7 +294,7 @@ func (server *Server) admitFeedIncident(response http.ResponseWriter, request *h
 		writeError(response, http.StatusBadRequest, "signature_base64 is invalid")
 		return
 	}
-	result, err := server.store.AdmitFeedIncident(request.Context(), incident.SignedFeedIncidentRequest{FeedAdmissionRequest: incident.FeedAdmissionRequest{SourceID: input.SourceID, SourceEventID: input.SourceEventID, Payload: payload, Signature: signature}})
+	result, err := server.store.AdmitFeedIncident(request.Context(), incident.SignedFeedIncidentRequest{FeedAdmissionRequest: incident.FeedAdmissionRequest{SourceID: input.SourceID, SourceEventID: input.SourceEventID, ClaimedAt: input.ClaimedAt, Payload: payload, Signature: signature}})
 	if err != nil {
 		writeIncidentError(response, err)
 		return
@@ -281,6 +310,10 @@ func (server *Server) create(response http.ResponseWriter, request *http.Request
 		writeError(response, http.StatusBadRequest, "invalid JSON request")
 		return
 	}
+	// created_by is bound to the authenticated principal (M7); any
+	// client-supplied attribution is discarded.
+	principal, _ := principalFrom(request)
+	input.CreatedBy = principal.Subject
 	created, err := server.store.Create(request.Context(), input)
 	if err != nil {
 		writeIncidentError(response, err)
@@ -377,7 +410,7 @@ func writeIncidentError(response http.ResponseWriter, err error) {
 		writeError(response, http.StatusNotFound, err.Error())
 	case errors.Is(err, isr.ErrForbidden):
 		writeError(response, http.StatusForbidden, "insufficient role or clearance")
-	case errors.Is(err, incident.ErrIdempotencyConflict), errors.Is(err, incident.ErrCorrelationConflict), errors.Is(err, incident.ErrOptimisticConflict), errors.Is(err, incident.ErrInvalidTransition),
+	case errors.Is(err, incident.ErrIdempotencyConflict), errors.Is(err, incident.ErrCorrelationConflict), errors.Is(err, incident.ErrOptimisticConflict), errors.Is(err, incident.ErrInvalidTransition), errors.Is(err, incident.ErrFeedSourceKeyConflict),
 		errors.Is(err, isr.ErrConflict), errors.Is(err, ledger.ErrConflict), errors.Is(err, ledger.ErrDualControl), errors.Is(err, ledger.ErrAlreadyConfirmed):
 		writeError(response, http.StatusConflict, err.Error())
 	default:
